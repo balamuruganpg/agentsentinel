@@ -13,7 +13,9 @@ from agentsentinel.trace import Step
 SHELL_TOOLS = frozenset(
     {"shell", "bash", "sh", "exec", "exec_command", "run_command", "code_exec"}
 )
-COMMAND_FIELDS = frozenset({"command", "cmd", "command_line", "script", "code"})
+COMMAND_FIELDS = frozenset(
+    {"command", "cmd", "command_line", "cmdline", "script", "code", "input"}
+)
 _SEPARATORS = ";&|()\n"
 _SHELL_COMMAND_OPTION = re.compile(r"-[a-z]*c[a-z]*")
 _PYTHON = re.compile(r"python(?:3(?:\.\d+)?)?")
@@ -98,7 +100,31 @@ _RSYNC_VALUES = {
     "--rsh",
 }
 _NC_VALUES = {"-i", "-p", "-s", "-w", "-m", "-q", "-W", "-X", "-x"}
-_REDIRECTS = {"<", "<<", "<<<", ">", ">>", "<>", ">|"}
+_REDIRECTS = {"<", "<<", "<<<", ">", ">>", "<>", ">|", "&>"}
+_READERS = frozenset(
+    {
+        "awk",
+        "base64",
+        "bat",
+        "cat",
+        "head",
+        "less",
+        "more",
+        "nl",
+        "od",
+        "strings",
+        "tac",
+        "tail",
+        "type",
+        "xxd",
+    }
+)
+_HEAD_VALUES = {"-n", "-c", "-q"}
+_ENV_WRAPPERS = frozenset({"busybox", "nice", "nohup", "time", "ionice"})
+_SUBSTITUTED_READ = re.compile(
+    r"(?:\$\(|<\()\s*(?:cat|head|tail|type|base64|nl)\s+([^)]*)",
+    re.IGNORECASE,
+)
 
 
 def shell_commands(step: Step) -> Iterator[list[str]]:
@@ -138,17 +164,165 @@ def _split_shell_commands(value: str) -> Iterator[list[str]]:
         yield command
 
 
+def _unwrap_env(words: list[str]) -> list[str] | None:
+    """Return the command after ``env`` assignments, or None for a bare dump."""
+    index = 0
+    rest = words[1:]
+    while index < len(rest):
+        word = rest[index]
+        if word == "--":
+            index += 1
+            break
+        if word.startswith("-") or ("=" in word and not word.startswith("=")):
+            index += 1
+            continue
+        break
+    if index >= len(rest):
+        return None
+    return rest[index:]
+
+
 def unwrap_command(command: list[str]) -> list[str]:
-    if posixpath.basename(command[0]) in {"sudo", "command"}:
-        return next(
-            (
-                command[index:]
-                for index, word in enumerate(command[1:], 1)
-                if not word.startswith("-")
-            ),
-            [],
-        )
-    return command
+    """Drop sudo, command, env, and other wrappers that hide the real program."""
+    words = command
+    for _ in range(6):
+        if not words:
+            return []
+        program = posixpath.basename(words[0]).lower()
+        if program in {"sudo", "command"}:
+            nxt = next(
+                (
+                    words[index:]
+                    for index, word in enumerate(words[1:], 1)
+                    if not word.startswith("-")
+                ),
+                [],
+            )
+            if not nxt:
+                return words
+            words = nxt
+            continue
+        if program == "env":
+            unwrapped = _unwrap_env(words)
+            if not unwrapped:
+                return words
+            words = unwrapped
+            continue
+        if program in _ENV_WRAPPERS:
+            nxt = next(
+                (
+                    words[index:]
+                    for index, word in enumerate(words[1:], 1)
+                    if not word.startswith("-")
+                ),
+                [],
+            )
+            if not nxt:
+                return words
+            words = nxt
+            continue
+        return words
+    return words
+
+
+def _quoted_operand(token: str) -> str:
+    return token.strip().strip("\"'").strip()
+
+
+def _substituted_reads(value: str) -> Iterator[str]:
+    for match in _SUBSTITUTED_READ.finditer(value):
+        inner = match.group(1).strip()
+        if not inner:
+            continue
+        operand = _quoted_operand(inner.split()[0])
+        if operand:
+            yield operand
+
+
+def _reader_operands(command: list[str]) -> Iterator[str]:
+    if not command:
+        return
+    invoked = unwrap_command(command)
+    if not invoked:
+        return
+    program = posixpath.basename(invoked[0]).lower()
+    if program in {"cmd", "cmd.exe"}:
+        words = [word.lower() for word in invoked[1:]]
+        if "type" in words:
+            yield from _reader_operands(["type", *invoked[words.index("type") + 2 :]])
+        return
+    if program in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+        words = invoked[1:]
+        for index, word in enumerate(words):
+            if word.lower() not in {"get-content", "gc", "type", "cat"}:
+                continue
+            for nxt in words[index + 1 :]:
+                lowered = nxt.lower()
+                if lowered in {"-path", "-literalpath"}:
+                    continue
+                if nxt.startswith("-"):
+                    continue
+                yield _quoted_operand(nxt)
+                break
+        return
+    for option, value in command_arguments(invoked[1:], {"<", ">"}):
+        if option == "<" and value:
+            yield value
+    if program == "dd":
+        for option, value in command_arguments(invoked[1:], set()):
+            token = value if not option else ""
+            if token.startswith("if="):
+                yield token[3:]
+        return
+    if program not in _READERS and not (
+        program == "sed"
+        and any(word == "-n" or word.startswith("-n") for word in invoked[1:])
+    ):
+        return
+    value_options = _HEAD_VALUES if program in {"head", "tail"} else set()
+    for option, value in command_arguments(invoked[1:], value_options):
+        if option or not value or value == "-" or value.startswith("-"):
+            continue
+        if program in {"awk", "sed"} and "/" not in value and "\\" not in value:
+            continue
+        yield value
+
+
+def _commands_keeping_backslashes(value: str) -> Iterator[list[str]]:
+    """Tokenize a copy where backslashes are path separators, not escapes."""
+    for command in _split_shell_commands(value.replace("\\", "/")):
+        yield command
+        invoked = unwrap_command(command)
+        if (
+            len(invoked) >= 3
+            and posixpath.basename(invoked[0]) in {"bash", "sh"}
+            and _SHELL_COMMAND_OPTION.fullmatch(invoked[1])
+        ):
+            yield from _split_shell_commands(invoked[2].replace("\\", "/"))
+
+
+def shell_read_operands(step: Step) -> Iterator[str]:
+    """File paths a shell or Python command reads, without executing it."""
+    if step.family_name not in SHELL_TOOLS:
+        return
+    seen: set[str] = set()
+
+    def emit(operand: str) -> Iterator[str]:
+        if operand and operand not in seen:
+            seen.add(operand)
+            yield operand
+
+    for field, value in step.fields:
+        if field not in COMMAND_FIELDS:
+            continue
+        for operand in _substituted_reads(value):
+            yield from emit(operand)
+        for command in _commands_keeping_backslashes(value):
+            for operand in _reader_operands(command):
+                yield from emit(operand)
+    for source in _python_sources(step):
+        for operand in _python_read_paths(source):
+            yield from emit(operand)
 
 
 def command_arguments(
@@ -387,6 +561,58 @@ def _literal_text(node: ast.expr | None) -> str:
     return ""
 
 
+def _open_write_target(
+    call: ast.Call, imports: dict[str, str], paths: dict[str, str]
+) -> str:
+    """Path opened in a write mode. Opening with ``w`` truncates before close."""
+    if _callee(call.func, imports) not in {"open", "io.open"}:
+        return ""
+    mode = "r"
+    if len(call.args) >= 2:
+        mode = _literal_text(call.args[1]) or mode
+    else:
+        for keyword in call.keywords:
+            if keyword.arg == "mode":
+                mode = _literal_text(keyword.value) or mode
+    if mode[:1].lower() != "w":
+        return ""
+    target = call.args[0] if call.args else _nth_arg(call, 0, "file")
+    return _python_path(target, paths)
+
+
+def _call_string_path(node: ast.expr) -> str:
+    if not isinstance(node, ast.Call):
+        return ""
+    func = node.func
+    name = func.id if isinstance(func, ast.Name) else ""
+    if not name and isinstance(func, ast.Attribute):
+        name = func.attr
+    if name not in {"open", "Path"}:
+        return ""
+    if node.args:
+        return _literal_text(node.args[0])
+    for keyword in node.keywords:
+        if keyword.arg in {"file", "path"}:
+            return _literal_text(keyword.value)
+    return ""
+
+
+def _python_read_paths(source: str) -> Iterator[str]:
+    """Literal paths passed to open().read or Path.read_text/read_bytes."""
+    try:
+        program = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return
+    for node in ast.walk(program):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in {"read", "read_text", "read_bytes"}:
+            continue
+        path = _call_string_path(node.func.value)
+        if path:
+            yield path
+
+
 def _python_overwrite_path(
     call: ast.Call,
     imports: dict[str, str],
@@ -397,26 +623,22 @@ def _python_overwrite_path(
     func = call.func
     if isinstance(func, ast.Attribute) and func.attr in {"write_text", "write_bytes"}:
         return _path_object(func.value, imports, paths, objects) or ""
-    if isinstance(func, ast.Attribute) and func.attr in {
-        "write",
-        "writelines",
-        "truncate",
-    }:
-        opener = func.value
-        if isinstance(opener, ast.Call) and _callee(opener.func, imports) in {
-            "open",
-            "io.open",
-        }:
-            mode = "r"
-            if len(opener.args) >= 2:
-                mode = _literal_text(opener.args[1]) or mode
-            else:
-                for keyword in opener.keywords:
-                    if keyword.arg == "mode":
-                        mode = _literal_text(keyword.value) or mode
-            if mode[:1].lower() == "w":
-                target = opener.args[0] if opener.args else _nth_arg(opener, 0, "file")
-                return _python_path(target, paths)
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr in {"write", "writelines", "truncate"}
+        and isinstance(func.value, ast.Call)
+    ):
+        written = _open_write_target(func.value, imports, paths)
+        if written:
+            return written
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == "close"
+        and isinstance(func.value, ast.Call)
+    ):
+        return _open_write_target(func.value, imports, paths)
+    if _callee(func, imports) in {"open", "io.open"}:
+        return _open_write_target(call, imports, paths)
     if _python_name(func, imports) in _COPY_FUNCTIONS:
         source = _python_path(_nth_arg(call, 0, "src"), paths)
         if source in _NULL_DEVICE:

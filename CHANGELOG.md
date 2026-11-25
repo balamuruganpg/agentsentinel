@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.7.0
+
+- Treat a shell command that reads a sensitive path as a sensitive read, with
+  the same downstream taint as a read tool. Readers include `cat`, `head`,
+  `tail`, `type`, `Get-Content`, `less`, `more`, `od`, `xxd`, `base64`,
+  `dd if=`, `sed -n`, `awk`, `nl`, `strings`, `bat`, input redirects, command
+  and process substitution, and literal Python `open().read()` /
+  `Path.read_text()`. Wrappers (`sudo`, `command`, `env`, `busybox`, `nice`,
+  `nohup`, `time`, `ionice`) are peeled. Command text is also read from
+  `input` and `cmdline`. The read-family classifier feature is unchanged.
+- Resolve tool families for names outside the alias map: camelCase, a
+  trailing version segment, `__` and hyphen folding, and an evident action
+  class (`readfile`, `open_file`, `http_put`, `fetch`, `send_email`,
+  `run_terminal_cmd`, and the other names in `SPEC.md`). The stored tool
+  string still changes only through the exact alias map. Bare
+  `open_document`, `webhook_call`, and `terminal_run` stay map-only.
+- Judge each send against the sensitive reads that precede it in its own
+  flow. Content sinks stay tainted for the rest of the scan. `git_push`
+  taint clears when ordinary repo work intervenes. A shell command that both
+  reads and transfers is judged in that step.
+- Join argument strings into a path only inside one field, or as a declared
+  directory field plus a filename field. Legacy secret tokens match non-prose
+  field names and values, not prose and not a cross-field product.
+- Stop letting result text grant or erase corroboration. Payroll and cookie
+  stores are path decisions. A `.key` file is not cleared by a public-key
+  result. A `.pem` stays sensitive unless the result is an explicit public
+  key or certificate and not a private key. Strong export directories
+  (`hr`, `payroll`, `compensation`, `salaries`, `confidential`, `export`)
+  beat a later sample segment. `private` alone does not.
+- Decode paths to a fixed point (at most eight passes of percent-decode,
+  backslash folding, and the NUL cut) before `normpath`, so a double encoding
+  or `%5c` / `%00` cannot undo an earlier pass.
+- Scope live-config overwrites. A non-empty project `file_write` is an
+  ordinary edit. Empty or absent content, and any write at a protected
+  location (kubeconfig, `/etc`, a `live` segment, `/workspace`,
+  `/workspaces`), still flags. `/workspace` stays scratch for deletion.
+  `cp` / `mv` / `install` / `rsync` / `tee` flag protected destinations.
+  `&>` is a truncate. `s/^$//` is not a wipe. Top-level `open(..., 'w')`
+  and `open(...).close()` count; a nested function body does not.
+- The classifier was not refit. One existing assertion changed:
+  `test_shell_transfer_after_sensitive_read_flags` now expects a shell
+  transfer of a sensitive file to flag on its own, because that command is
+  the sensitive read.
+- Independent benchmark unchanged: precision 0.8889, recall 1.0000,
+  F1 0.9412, FPR 0.0625, TP=40 FP=5 TN=75 FN=0. Every family stays at 1.0000.
+- TrustBreaker trace evasion re-measured twice with byte-identical
+  aggregates: bypass 3.84%, robustness 96.16% (v0.6.0: 3.04% / 96.96% on
+  the same 45 flagged originals and 1,745 applicable variants).
+
 ## 0.6.0
 
 - Gather sensitive-path evidence from every argument string and from joined

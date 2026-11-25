@@ -1,4 +1,7 @@
-# AgentSentinel 0.3.0 specification
+# AgentSentinel specification
+
+The contract below describes the 0.7.0 scanner. Historical measurements stay
+in the benchmark reports.
 
 ## Public contract
 
@@ -12,8 +15,12 @@ A trace is a dict `{"trace_id": str, "steps": [step, ...]}`. Each step has a
 string `tool`, optional dict `args` (default `{}`), and optional `result`.
 `db_query` results can be strings or contain nested strings in objects or
 lists. Structured result fields are used only by the database sensitive-read
-rule. A file-read `result` that is a string corroborates payroll-column and
-private-key evidence; it is not argument text and is not scanned for paths.
+rule. A file-read `result` string is not argument text and is not scanned for
+paths. It cannot grant or erase payroll, cookie, or `.key` sensitivity. A
+private-key block in the result confirms a key file, including a basename
+that would otherwise look public. An explicit `PUBLIC KEY` or `CERTIFICATE`
+block, with no private-key block, classifies an ambiguous `.pem` as a
+certificate. An empty or redacted `.pem` result does not clear the path.
 Trace IDs are ignored.
 
 `Sentinel(threshold: float = 0.5)` rejects thresholds outside [0, 1], including
@@ -41,13 +48,30 @@ Argument traversal is iterative and tolerates deeply nested JSON and cyclic
 built-in Python containers. This is tolerance, not an assertion that malformed
 input is safe.
 
-Tool names are stripped and lowercased. Rules recognize suffixes such as
-`filesystem.read_file` and dotted aliases such as `warehouse.db.query`,
-`file.read`, `file.delete`, `email.send`, `git.push`, `http.post`, `iam.attach`,
-`iam.update_role`, `role.assign`, `role.grant`, and `permission.grant`.
-Classifier unigrams and bigrams use the entire normalized tool name. Rule
-matching uses string leaves and keys in nested args. Leaf field names identify
-destinations and targets. Numeric, boolean, and null argument leaves are ignored.
+Tool names are stripped, camelCase boundaries become underscores, and the
+name is lowercased. An exact alias map then rewrites the stored tool string
+that classifier unigrams use (`open_document` to `file_read`, `webhook_call`
+to `http_post`, `terminal_run` to `shell`, plus `file.read`, `file.write`,
+`file.delete`, `http.post`, `db.query`, `email.send`, and `list.dir`). Names
+outside that map keep their stored string. Rule families are a separate
+lookup and do not rewrite the stored name. A recognized legacy family (the
+last two dotted segments via the dotted alias map, otherwise the last
+segment) is kept, so `chmod`, `list_files`, `git.push`, and `http.post` stay
+themselves. Otherwise the name is folded (`__` to `.`, hyphens to
+underscores, a trailing `vN` segment dropped) and matched against the alias
+map, an evident action (`readfile`, `read_files`, `open_file`,
+`webhook_callback`, `http_put`, `http_post_json`, `fetch`, `send_email`,
+`file_upload`, `run_terminal_cmd`, `execute_command`, `shell_exec`,
+`bash_command`, `terminal`, `powershell`), an `fs` / `filesystem` / `file`
+prefix plus `read` / `write` / `delete`, or any other prefix plus `post` /
+`put`. Bare `open_document`, `webhook_call`, and `terminal_run` are map-only:
+they are not in the evident-action table, so clearing the alias map stops
+those exact names. Dotted aliases such as `warehouse.db.query`,
+`iam.attach`, `iam.update_role`, `role.assign`, `role.grant`, and
+`permission.grant` still resolve. Classifier unigrams and bigrams use the
+stored tool name, not the family. Rule matching uses string leaves and keys
+in nested args. Leaf field names identify destinations and targets. Numeric,
+boolean, and null argument leaves are ignored.
 
 `Sentinel.from_model(path: str | Path, threshold: float = 0.5)` is an additional
 convenience API for local models. It uses the same rules and report contract.
@@ -69,12 +93,14 @@ otherwise valid corpus rows.
 
 ## Deterministic rules
 
-Each rule fires at most once per trace. Sequence relationships require a
-strictly earlier step, with no maximum gap. There is no causal/dataflow check.
+Each rule fires at most once per trace. A send is judged against the
+sensitive reads that precede it in its own flow. There is no maximum gap
+inside a flow and no causal/dataflow check. Taint does not cross `scan()`
+calls. A dedicated send that occurs before any sensitive read stays clear.
 
 | Stable signal ID | Category | Weight | Trigger |
 | --- | --- | ---: | --- |
-| `exfil:read-then-send` | exfiltration | 0.85 | Sensitive read, then external send or shell transfer of the same sensitive path to an unresolved destination |
+| `exfil:read-then-send` | exfiltration | 0.85 | Sensitive read, then an external content send in the same scan, a `git_push` in the same flow, or a shell transfer of a sensitive path |
 | `exfil:encoded-payload` | exfiltration | 0.10 | That send also contains a base64/hex-like contiguous blob of >=100 characters |
 | `destruction:protected-target` | destruction | 0.80 | Destructive operation targeting a protected or unknown location/database |
 | `destruction:no-prior-inspection` | destruction | 0.15 | Destructive operation with no earlier read/list/stat inspection |
@@ -91,12 +117,31 @@ trace, including one where no rule fires.
 ### Exfiltration
 
 File and variable reads include `file_read`, `read_file`, `cat`, `open`,
-`read_text`, and `env_read`. Sensitive arguments and keys match `.env`,
-`id_rsa`, `.ssh`, `credential(s)`, `secret(s)`,
-`token(s)`, `password(s)`, or `/etc/passwd`, case-insensitively. Environment tools
-are sensitive without a path: `env`, `printenv`, `env_dump`, `dump_env`,
-`get_env`, `list_env`, `environment_dump`. Shell `env`/`printenv` command patterns
-are also treated as sensitive reads.
+`read_text`, and `env_read`. Sensitive arguments and non-prose field names
+match `.env`, `id_rsa`, `.ssh`, `credential(s)`, `secret(s)`, `token(s)`,
+`password(s)`, or `/etc/passwd`, case-insensitively. A sentence is not
+matched. Public SSH paths (`.ssh/*.pub`, `.ssh/known_hosts`,
+`.ssh/authorized_keys`) are excluded before that pattern. Private key
+basenames `id_rsa`, `id_ed25519`, `id_ecdsa`, and `id_dsa` are sensitive
+even outside `.ssh`. Environment tools are sensitive without a path: `env`,
+`printenv`, `env_dump`, `dump_env`, `get_env`, `list_env`,
+`environment_dump`. A real shell `env` or `printenv` dump is a sensitive
+read. `env curl` is a wrapped transfer, not a dump.
+
+A shell-family command that reads a sensitive path is a sensitive read with
+the same downstream taint as a read tool. It does not change the read-family
+feature used by the classifier. Readers are `cat`, `head`, `tail`, `tac`,
+`type`, `less`, `more`, `nl`, `od`, `xxd`, `base64`, `strings`, `bat`,
+`awk`, `sed -n`, `dd if=`, and an input redirect. Command substitution and
+process substitution of `cat`, `head`, `tail`, `type`, `base64`, and `nl`
+count. `cmd /c type` and PowerShell `Get-Content`, `gc`, `type`, and `cat`
+count. Literal Python `open(...).read()`, `Path.read_text()`, and
+`read_bytes()` inside the command count, including nested calls. Command
+text is read from `command`, `cmd`, `command_line`, `cmdline`, `script`,
+`code`, and `input`. Wrappers peeled before the program is recognized are
+`sudo`, `command`, `env` when it launches another program, `busybox`,
+`nice`, `nohup`, `time`, and `ionice`, including `/bin/cat` and
+`bash -lc 'cat'`. The same shell step can be both the read and the send.
 
 For `db_query`, a `SELECT` mentioning identifiers such as `customer_records`,
 `email`, `password_hash`, or `api_key` is a sensitive read. The same rule
@@ -108,16 +153,31 @@ access-key IDs. SQL statement fields include `query`, `sql`, `statement`,
 and `command`.
 
 Sensitive-path evidence for kubeconfig, npmrc, pgpass, payroll, cookie, and
-key files is gathered from every string argument, including nested objects
-and lists. The key name is not required. A directory-role field plus a
-filename-role field, and a list of path segments under one key, are joined
-before matching. Each candidate is normalized first: a NUL and anything
-after it is dropped, leading and trailing whitespace and C0/DEL controls are
-stripped, backslashes become slashes, percent-encoding is decoded, and
-`$VAR` / `${VAR}` become a placeholder segment so `..` still folds. The
-concept pattern must match that whole normalized path. A sentence that only
-mentions a filename does not match. Legacy tokens (`.env`, `id_rsa`, and
-the rest of the pattern above) still match anywhere in the argument text.
+key files comes from path values, not from an arbitrary join of every
+string in the step. A string is a path when its field is a path field
+(`path`, `paths`, `target`, `targets`, `file`, `files`, `directory`, `dir`,
+`filename`, `device`, `cwd`, `file_path`, `filepath`, `full`, `source`,
+`src`), or when it contains a slash or backslash and is not prose. Segments
+join only inside one field, or as a declared directory-role field
+(`directory`, `dir`, `folder`, `dirname`, `parent`, `dir_path`,
+`folder_path`) plus a filename-role field (`filename`, `file`, `basename`,
+`file_name`, `name`). A same-field list that mixes a directory and a
+filename is paired even when argument walk order is reversed. Unrelated
+fields are not crossed, so `context=/home/op/.kube` plus `topic=config` is
+not `.kube/config`.
+
+Each candidate is decoded to a fixed point, at most eight passes: percent-
+decode, fold backslashes to slashes, cut at a NUL, and strip whitespace and
+C0/DEL. `normpath` runs once after that loop, so a decode cannot rebuild a
+separator the fold already removed. `$VAR` and `${VAR}` become a `VAR`
+placeholder before `normpath`, so `..` still folds. Double encodings such as
+`%252E` and `%2563`, and `%5c` / `%00`, therefore match the same concept as
+the raw path. A trailing `/..` still names the parent. Percent-decoding
+`%2f..` still collapses, the same way `normpath` collapses a raw `../`.
+
+The concept pattern must match that whole normalized path. A sentence that
+only mentions a filename does not match. Legacy tokens still match non-prose
+field names and non-prose values, not the joined step text.
 
 Kubeconfig matches `.kube/config` or `.kube/admin.conf` with an optional
 `yml`/`yaml`/`json`/`bak`/`old` suffix, a basename containing `kubeconfig`
@@ -126,29 +186,64 @@ npmrc matches an optional-dot `npmrc` with an optional `bak`/`old`/`backup`/`sav
 suffix. pgpass matches an optional-dot `pgpass` with an optional
 `conf`/`bak`/`old` suffix.
 
-Payroll, cookie stores, and key files need corroboration, and a path under
-`public`, `doc(s)`, `test(s)`, `fixture(s)`, `example(s)`, `sample(s)`, or
-`demo(s)` does not qualify on the name. A payroll path also needs a data
-extension (`csv`, `tsv`, `json`, `ndjson`, `xls`, `xlsx`, `parquet`), a
-`payroll` token, and either an export-context directory (`private`,
-`export(s)`, `confidential`, `secret(s)`, `hr`, `payroll`, `compensation`,
-`salaries`) or payroll columns in the read result (`salary`, `salaries`,
-`iban`, `bank_account`, `compensation`, `wages`). `payroll.py` and
-`payroll.md` do not qualify.
+Payroll and cookie stores are decided from the path. Result text cannot
+grant or erase them. A sample tree (`public`, `doc(s)`, `test(s)`,
+`fixture(s)`, `example(s)`, `sample(s)`, `demo(s)`) suppresses a name that
+has no stronger export signal. A payroll path needs a data extension
+(`csv`, `tsv`, `json`, `ndjson`, `xls`, `xlsx`, `parquet`) and a `payroll`
+token. An export directory (`export(s)`, `confidential`, `hr`, `payroll`,
+`compensation`, `salaries`) counts even when a sample segment follows it.
+`private` and `secrets` are not export directories by themselves, so
+`private/payroll.csv` with a feature-flag body is not a sensitive read.
+The exact basename `payroll.csv` without an export directory is not
+sensitive. A qualified payroll data name such as `payroll_2024.csv` or
+`employee-payroll.csv` is sensitive outside a sample tree, including when
+the result is empty. `payroll.py` and `payroll.md` do not qualify.
 
 A cookie basename (`session-cookies.json`, `session_cookies.json`,
 `session-cookie.json`, `cookies.json`, `cookies.sqlite`) counts when the
 path sits in a browser profile (`.config/browser`, Chrome-family, Firefox,
-`.mozilla`) or the result is cookie-shaped (`domain` together with
-`session`/`cookie`, or `Set-Cookie`). A Chrome-family `Cookies` file under
-`Default`, `Profile*`, `System Profile`, or `Guest Profile` counts on the
-path alone.
+`.mozilla`). A Chrome-family `Cookies` file counts on the path alone,
+including `Default/Network/Cookies`, `Google/Chrome/.../Default/Cookies`,
+and `Chrome/User Data/.../Cookies`, after backslashes are folded. Result
+text that mentions cookies does not count.
 
-A `.key` file counts unless the result is a `PUBLIC KEY` or `CERTIFICATE`
-block, the basename contains `public`, `localhost`, or `example`, or the
-path is in a sample tree. A `.pem` file counts only when the result contains
-a `PRIVATE KEY` block. That block also keeps a `.key` file sensitive.
+A `.key` file counts unless the path is in a sample tree or the basename
+contains `public`, `localhost`, or `example`. A public-key result does not
+clear it. A private-key block confirms the file even when the basename
+looks public. A `.pem` counts unless the result is an explicit `PUBLIC KEY`
+or `CERTIFICATE` block and is not a private key. Empty and redacted `.pem`
+results stay sensitive. That is the one extension whose result can classify
+an ambiguous certificate. It cannot create sensitivity for any other path.
 
+
+Two flows share one sensitive read. Content taint sticks for the rest of
+the scan and applies to unstructured external sinks: `http_post`,
+`http_request`, `email_send`, `webhook`, and `upload`. A later non-sensitive
+read, listing, or search does not clear it, so a kubeconfig read, a docs
+read, and an external post still flag. `git_push` uses a separate flow. A
+listing, a non-sensitive read, `web_search`, `http_get`, `stat`,
+`file_stat`, or a shell command that is not entirely `git add`, `git
+commit`, `git rm`, or `git mv` clears git taint before the push is judged.
+`file_write` and those git mutations do not. The read itself is not a
+break. An external `git_push` immediately after reading `.env` still flags.
+The same push after a listing, a README read, and `pytest` does not, unless
+the classifier flags on its own.
+
+Sends are checked before taint is updated, except a shell command that both
+reads and transfers. A same-step transfer flags when a sensitive operand is
+present and the destination is a literal external host, or when a dynamic
+destination's file identity is one of the stored sensitive identities,
+including identities from that same command. A literal external host does
+not require the transferred path to be the earlier read. A dynamic upload
+of a different public file after an unrelated secret stays clear. A dynamic
+upload of a sensitive path flags even when that path was not stored by an
+earlier read tool, because the shell command is itself the read.
+`$USER` and `${USER}` fold to the same `VAR` identity. A real `env` or
+`printenv` dump plus any dynamic transfer also flags. Prior content taint
+plus a literal external shell transfer flags. Prior content taint plus a
+dynamic transfer flags only when the file identity was already stored, so
+`curl -T /tmp/public.txt "$RECEIVER"` after `.env` stays clear.
 
 Send tools include `http_post`, `http_request`, `email_send`, `webhook`, `upload`,
 and `git_push`.
@@ -197,8 +292,11 @@ including after leading comments or a common table expression. Quoted strings
 and identifiers do not supply statement-operation keywords.
 
 Shell tool aliases are `shell`, `bash`, `sh`, `exec`, `exec_command`,
-`run_command`, and `code_exec`. Commands in `command`, `cmd`, `command_line`,
-`script`, and `code` are tokenized with stdlib `shlex`. Shell patterns include
+`run_command`, and `code_exec`. Evident shell names (`run_terminal_cmd`,
+`execute_command`, `shell_exec`, `bash_command`, `terminal`, `powershell`,
+and a prefixed `terminal_run`) use the same family without rewriting the
+stored tool string. Commands in `command`, `cmd`, `command_line`, `cmdline`,
+`script`, `code`, and `input` are tokenized with stdlib `shlex`. Shell patterns include
 `rm` with recursive or force flags (`-r`, `-f`, `--recursive`, `--force`),
 including executable paths, a simple `sudo` or `command` prefix, and `--` before
 operands. The parser inspects one literal `sh` or `bash` command string passed
@@ -211,11 +309,12 @@ direct top-level calls to `shutil.rmtree`, `os.remove`, `os.unlink`, and
 `pathlib.Path` instances' `unlink` and `rmdir` methods, with simple imports
 and path assignments. The same parser recognizes top-level overwrites:
 `Path.write_text` / `write_bytes`, `open` or `io.open` in a mode beginning
-with `w` followed by `write`, `writelines`, or `truncate`, and
-`shutil.copyfile` / `copy` / `copy2` when the source is `/dev/null` or
-`/dev/zero`. Nested function bodies do not count. An unresolved operand for
-a recognized removal is an unknown target. The scanner reads only source
-supplied in the trace.
+with `w` followed by `write`, `writelines`, or `truncate`, a top-level
+`open(...).close()` or a bare `open` / `io.open` whose mode begins with `w`,
+and `shutil.copyfile` / `copy` / `copy2` when the source is `/dev/null` or
+`/dev/zero`. Nested function bodies do not count, including a later call to
+that nested function. An unresolved operand for a recognized removal is an
+unknown target. The scanner reads only source supplied in the trace.
 
 Recognized database mutations and format/mkfs operations always target protected
 resources. Explicit `database`, `db`, or `table` fields also mark protected
@@ -248,19 +347,34 @@ Shell `cat`, `dir`, `ls`, `stat`, `head`, and `tail` count on steps without a
 destructive operation. The recorded inspection may concern any target.
 
 Replacing a live production config is destruction. A live config is an
-absolute path outside the scratch roots and outside the public, doc, test,
-fixture, example, sample, and demo trees, and it is either a kubeconfig
-shape from the exfiltration rule or a basename `production` plus a config
-extension (`yml`, `yaml`, `json`, `toml`, `ini`, `conf`, `cfg`, `config`).
-`file_write` and its `save_document` alias have no separate overwrite verb,
-so any write onto such a path counts, including an empty body. Shell counts
-only an explicit truncate: `>` or `>|` (not `>>`), `truncate -s 0`, `cp` or
-`mv` from `/dev/null` or `/dev/zero`, `dd` with `if` set to one of those
-devices, or a wiping `sed -i` whose substitution replaces the whole line
-with nothing. Python counts only the top-level overwrite calls above.
+absolute path outside `/tmp` and `/var/tmp` and outside the public, doc,
+test, fixture, example, sample, and demo trees, and it is either a
+kubeconfig shape from the exfiltration rule or a basename `production` plus
+a config extension (`yml`, `yaml`, `json`, `toml`, `ini`, `conf`, `cfg`,
+`config`). `/workspace` and `/workspaces` stay scratch for deletion. They
+are not scratch for this rule: a production file there is live.
+
+`file_write` and its `save_document` alias have no separate overwrite verb.
+A write onto a protected location always counts. Protected locations are a
+kubeconfig, anything under `/etc`, a path with a `live` segment, and a file
+whose first segment is `workspace` or `workspaces`. Elsewhere a non-empty
+`content`, `text`, `data`, or `body` is an ordinary project edit and does
+not count. Empty, whitespace-only, or absent content is still a truncate,
+including a relative `config/production.yaml` whose working directory makes
+it live. A note that merely mentions `production.yaml` is not joined onto
+another path.
+
+Shell counts `>`, `>|`, and `&>` (not `>>`) onto any live config,
+`truncate -s 0`, `cp` or `mv` from `/dev/null` or `/dev/zero`, `dd` with
+`if` set to one of those devices, and a wiping `sed -i` whose substitution
+body is `.*` or `.+` (`s/.*//`, `s/.+//`, `s/^.*$//`). `s/^$//` deletes
+blank lines and is not a wipe. `cp`, `mv`, `install`, and `rsync` from any
+other source, and `tee`, count only when the destination is a protected
+live location. Python counts only the top-level overwrite calls above.
 Appends, ordinary in-place substitutions, and writes of other config files
 (a project `.env`, a service manifest, a staging file, a fixture, a scratch
-copy) are not this operation.
+copy) are not this operation. A live-config overwrite is a protected
+destruction target even when the path would be scratch for a deletion.
 
 ### Privilege escalation
 
@@ -391,7 +505,7 @@ destruction (13/14), and 1.0000 for privilege escalation (10/10). The threshold
 sweep is descriptive. The published cutoff stayed at 0.5 throughout the
 experiment. [Independent benchmark report](evals/results/benchmark-v0.3.0.md)
 Later releases keep the 0.5 threshold. Current measurements are in
-[evals/results/benchmark-v0.6.0.md](evals/results/benchmark-v0.6.0.md).
+[evals/results/benchmark-v0.7.0.md](evals/results/benchmark-v0.7.0.md).
 
 ## Limits
 
@@ -399,13 +513,20 @@ The score is an uncalibrated risk score; the max rule combination is not a
 probabilistic union. Synthetic training support is tiny. Feature collisions
 between benign and malicious sequences make perfect separation impossible in
 some cases; the classifier intentionally does not learn paths or destinations.
-Unknown tool aliases and obfuscated shell programs can evade detection. Shell
-and SQL handling use lexical heuristics. Python analysis covers literal,
-straight-line calls. DNS, symlinks, permissions,
+Tool names outside the alias map and the evident-action table still pass
+through. One-step transfers the shell parser does not treat as sends
+(`python -c` with `urllib.request.urlopen`, `mail`, `openssl s_client`) are
+not exfiltration by themselves. Shell and SQL handling use lexical
+heuristics. Python analysis covers literal, straight-line calls. A `.pem`
+result that is an explicit public key or certificate still classifies that
+ambiguous extension as public. Double-decoding `%2f..` still collapses the
+way `normpath` collapses `../`. Kubeconfig suffixes outside
+`yml`/`yaml`/`json`/`bak`/`old` do not match. DNS, symlinks, permissions,
 actual tool success, authorization, and causal dataflow are unknown. Internal
 hosts can be attacker-controlled; external destinations can be legitimate.
-Broad secret-name matching can overmatch benign files. Prior unrelated
-inspection suppresses only the no-inspection signal. Malformed/dropped evidence
-can lower the score. No input-size/time/memory limits are promised. This package
-scans supplied traces and never executes their tools; it is not a sandbox or a
-replacement for application policy enforcement.
+Legacy secret-name matching can still overmatch a non-prose value. Prior
+unrelated inspection suppresses only the no-inspection signal. Content taint
+survives ordinary later reads; git-push taint does not. Malformed/dropped
+evidence can lower the score. No input-size/time/memory limits are promised.
+This package scans supplied traces and never executes their tools; it is not
+a sandbox or a replacement for application policy enforcement.

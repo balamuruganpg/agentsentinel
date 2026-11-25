@@ -357,7 +357,12 @@ def test_shell_transfer_after_sensitive_read_flags(command: str) -> None:
     report = scanner.scan(trace(read, send))
     assert report.flagged
     assert "exfil:read-then-send" in report.signals
-    assert "exfil:read-then-send" not in scanner.scan(trace(send, read)).signals
+    # The shell command reads the sensitive file itself, so it is exfiltration
+    # without a later read tool. A later read must not be required, and it
+    # must not be what creates the signal.
+    alone = scanner.scan(trace(send))
+    assert "exfil:read-then-send" in alone.signals
+    assert alone.signals == scanner.scan(trace(send, read)).signals
 
 
 @pytest.mark.parametrize(

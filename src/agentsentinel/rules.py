@@ -15,6 +15,7 @@ from agentsentinel._shell import (
     shell_commands,
     shell_python_overwrites,
     shell_python_targets,
+    shell_read_operands,
     shell_transfers,
     unwrap_command,
 )
@@ -165,8 +166,12 @@ _COOKIE_NAME = re.compile(
     re.IGNORECASE,
 )
 _CHROME_COOKIES = re.compile(
-    r"(?:^|/)(?:google-chrome|chromium|microsoft-edge|brave(?:-browser)?)"
-    r"/(?:default|profile[^/]*|system profile|guest profile)/cookies$",
+    r"(?:^|/)(?:"
+    r"(?:google-chrome|chromium|microsoft-edge|brave(?:-browser)?)"
+    r"/(?:default|profile[^/]*|system profile|guest profile)(?:/network)?/cookies"
+    r"|google/chrome/(?:[^/]+/)*?(?:default|profile[^/]*)(?:/network)?/cookies"
+    r"|chrome/user data/(?:default|profile[^/]*)(?:/network)?/cookies"
+    r")$",
     re.IGNORECASE,
 )
 _BROWSER_CONTEXT = re.compile(
@@ -174,23 +179,17 @@ _BROWSER_CONTEXT = re.compile(
     r"brave(?:-browser)?|firefox|\.mozilla)(?:/|$)",
     re.IGNORECASE,
 )
-_COOKIE_CONTENT = re.compile(
-    r"(\bdomain\b.+\b(?:session|cookie)\b|\b(?:session|cookie)\b.+\bdomain\b"
-    r"|set-cookie)",
-    re.IGNORECASE | re.DOTALL,
-)
 _PAYROLL_TOKEN = re.compile(r"(?<![a-z0-9])payroll(?![a-z0-9])", re.IGNORECASE)
 _PAYROLL_DATA = re.compile(
     r"\.(?:csv|tsv|json|ndjson|xlsx?|parquet)$",
     re.IGNORECASE,
 )
+# `private` and `secrets` are not export directories by themselves. A feature
+# flag file such as private/payroll.csv is ordinary. hr, payroll, compensation,
+# salaries, confidential, and export still are, even when a sample segment
+# follows them.
 _PAYROLL_EXPORT = re.compile(
-    r"(?:^|/)(?:private|exports?|confidential|secrets?|hr|payroll|compensation|"
-    r"salaries)(?:/|$)",
-    re.IGNORECASE,
-)
-_PAYROLL_COLUMNS = re.compile(
-    r"\b(?:salary|salaries|iban|bank_account|compensation|wages?)\b",
+    r"(?:^|/)(?:exports?|confidential|hr|payroll|compensation|salaries)(?:/|$)",
     re.IGNORECASE,
 )
 # Public, documentation, and fixture trees do not make a basename sensitive.
@@ -209,12 +208,25 @@ _PUBLIC_KEY_BLOCK = re.compile(
     re.IGNORECASE,
 )
 _PUBLIC_KEY_NAME = re.compile(r"public|localhost|example", re.IGNORECASE)
+_PUBLIC_SSH = re.compile(
+    r"(?:^|/)\.ssh/(?:[^/]*\.pub|known_hosts|authorized_keys)$",
+    re.IGNORECASE,
+)
+_SSH_PRIVATE_NAME = re.compile(
+    r"(?:^|/)id_(?:rsa|ed25519|ecdsa|dsa)$",
+    re.IGNORECASE,
+)
 _PRODUCTION_CONFIG = re.compile(
     r"^production\.(?:ya?ml|json|toml|ini|conf|cfg|config)$",
     re.IGNORECASE,
 )
 _SHELL_VAR = re.compile(r"\$\{[^}\0]*\}|\$[A-Za-z_][A-Za-z0-9_]*")
-_WIPE_SUBSTITUTION = re.compile(r"s(.)(\^?\.\*\$?|\.\+|\^.*\$)\1\1([g0-9]*)")
+# Literal `.*` or `.+`, optionally anchored. `s/^$//` deletes blank lines and
+# is not a wipe; the body must contain `.*` or `.+`.
+_WIPE_SUBSTITUTION = re.compile(
+    r"s(.)(?:\^\.\*(?:\$)?|\.\*(?:\$)?|\.\+|\^\.\+\$?)\1\1([g0-9]*)"
+)
+_CONTROL_CHARS = "".join(chr(code) for code in (*range(32), 127))
 _ZERO_SIZE = re.compile(r"0+[bBkKmMgG]?$")
 _DIRECTORY_FIELDS = frozenset(
     {"directory", "dir", "folder", "dirname", "parent", "dir_path", "folder_path"}
@@ -279,11 +291,16 @@ _TARGET_FIELDS = frozenset(
         "device",
     }
 )
+_PATH_FIELDS = _TARGET_FIELDS | frozenset(
+    {"cwd", "file_path", "filepath", "full", "source", "src"}
+)
 _SYSTEM_ROOTS = frozenset(
     {"bin", "boot", "dev", "etc", "lib", "lib64", "proc", "sbin", "sys", "usr", "var"}
 )
 _SCRATCH_DIRS = {"build", "tmp", "temp"}
 _SCRATCH_ROOTS = ("/tmp", "/var/tmp", "/workspace", "/workspaces")
+# Deletion still treats /workspace as scratch. A production-config write does not.
+_CONFIG_SCRATCH_ROOTS = ("/tmp", "/var/tmp")
 _SOURCE_DIRS = {"src", "source", "tests", ".git"}
 _NON_LITERAL_PATH = frozenset("$`~*?[]{}\0")
 
@@ -365,21 +382,78 @@ def _sensitive_read(step: Step, cwd: str = "") -> bool:
             or _SECRET_RESULT.search(value)
             for field, value in step.result_fields
         )
-    return (
-        step.family_name in ENV_TOOLS
-        or _shell_env(step)
-        or (
-            step.family_name in READ_TOOLS
-            and (
-                # Legacy tokens still match any argument text, including keys.
-                bool(_SENSITIVE.search(step.text))
-                or any(
-                    _path_is_sensitive(value, cwd, step.result)
-                    for value in _path_candidates(step)
-                )
-            )
+    if step.family_name in ENV_TOOLS or _shell_env(step):
+        return True
+    if step.family_name in READ_TOOLS and (
+        _legacy_sensitive_argument(step)
+        or any(
+            _path_is_sensitive(value, cwd, step.result)
+            for value in _path_candidates(step)
         )
+    ):
+        return True
+    # A shell read is rule taint only. It does not change is_read, so the
+    # bundled classifier features stay on the trained tool families.
+    return step.family_name in SHELL_TOOLS and bool(
+        _shell_sensitive_operands(step, cwd)
     )
+
+
+def _prose(value: str) -> bool:
+    return any(char.isspace() for char in value)
+
+
+def _is_public_ssh(path: str) -> bool:
+    return bool(path) and _PUBLIC_SSH.search(path) is not None
+
+
+def _legacy_sensitive_argument(step: Step) -> bool:
+    """Legacy tokens on a key or a single path-like value, never prose."""
+    for field, value in step.fields:
+        if (
+            field
+            and not _prose(field)
+            and _SENSITIVE.search(field)
+            and not _is_public_ssh(_normalize_match_path(field))
+        ):
+            return True
+        if not value or _prose(value) or not _SENSITIVE.search(value):
+            continue
+        normalized = _candidate_for_match(value, "") or _normalize_match_path(value)
+        if not _is_public_ssh(normalized):
+            return True
+    return False
+
+
+def _shell_sensitive_operands(step: Step, cwd: str) -> tuple[str, ...]:
+    seen: set[str] = set()
+    found: list[str] = []
+    sources = (
+        *shell_read_operands(step),
+        *(
+            source
+            for transfer in shell_transfers(step)
+            for source in transfer.files
+        ),
+    )
+    for operand in sources:
+        if not operand or operand in seen:
+            continue
+        seen.add(operand)
+        if _path_is_sensitive(operand, cwd, ""):
+            found.append(operand)
+    return tuple(found)
+
+
+def _real_env_dump(step: Step) -> bool:
+    """True for env/printenv themselves, not for ``env curl`` style wrappers."""
+    for command in shell_commands(step):
+        if posixpath.basename(command[0]).lower() not in {"env", "printenv"}:
+            continue
+        invoked = unwrap_command(command)
+        if invoked and posixpath.basename(invoked[0]).lower() in {"env", "printenv"}:
+            return True
+    return False
 
 
 def _sql_statements(step: Step) -> Iterator[tuple[str, tuple[str, ...]]]:
@@ -667,6 +741,10 @@ def _protected_target(
     read: set[str],
     observed_dirs: set[str],
 ) -> bool:
+    # A live-config overwrite is protected even under /workspace, which stays
+    # scratch for deletion. The two exemptions are different operations.
+    if _config_overwrite(step, cwd):
+        return True
     if step.family_name in {"db_query", "drop_table", "format", "mkfs"} or (
         _shell_always_protected(step)
     ):
@@ -692,19 +770,23 @@ def _literal_path(value: str, cwd: str = "") -> str:
 
 
 def _normalize_match_path(value: str) -> str:
-    """Fold literal-path quirks before a concept pattern runs.
+    """Decode a path to a fixed point, then fold ``..`` once.
 
-    Trailing whitespace and control characters, a NUL and anything after it,
-    backslashes, and percent-encoded dots are removed the way a legacy
-    ``.env`` token survives inside a longer string. Shell variables become a
-    placeholder segment so ``..`` still folds when ``$`` is present.
+    Percent-decoding, backslash folding, and the NUL cut repeat up to eight
+    times so a second encoding or a ``%00`` / ``%5c`` cannot undo an earlier
+    pass. ``normpath`` runs after that loop: folding inside the loop would
+    rebuild separators that a later decode would have to interpret again.
+    Shell variables become a placeholder segment so ``..`` still folds when
+    ``$`` is present.
     """
-    value = value.split("\0", 1)[0]
-    value = value.strip()
-    value = value.strip("".join(chr(code) for code in (*range(32), 127)))
+    for _ in range(8):
+        decoded = unquote(value).replace("\\", "/")
+        decoded = decoded.split("\0", 1)[0].strip().strip(_CONTROL_CHARS)
+        if decoded == value:
+            break
+        value = decoded
     if not value:
         return ""
-    value = unquote(value.replace("\\", "/"))
     value = _SHELL_VAR.sub("VAR", value)
     absolute = value.startswith("/")
     normalized = posixpath.normpath(value)
@@ -739,19 +821,41 @@ def _single_segment(value: str) -> bool:
 
 
 def _path_candidates(step: Step) -> Iterator[str]:
-    """Every argument string, plus directory and filename pieces joined.
+    """Path values, same-field segment lists, and declared directory+file pairs.
 
-    The key name is not evidence. A path under ``file_path``, ``source``, or a
-    nested leaf counts the same as one under ``path``. A list of segments and
-    a directory field plus a filename field are joined before matching.
+    A string is a path when its field is a path field, or when it contains a
+    slash or backslash and is not prose. Pieces join only inside one field or
+    as a directory-role field plus a filename-role field. Unrelated arguments
+    are not crossed.
     """
-    values = [value for _field, value in step.fields]
-    yield from values
     grouped: dict[str, list[str]] = {}
     for field, value in step.fields:
         grouped.setdefault(field, []).append(value)
-    for parts in grouped.values():
-        if len(parts) >= 2 and all(_joinable(part) for part in parts):
+        if field in _PATH_FIELDS or (
+            value and not _prose(value) and ("/" in value or "\\" in value)
+        ):
+            yield value
+    for field, parts in grouped.items():
+        if len(parts) < 2 or not all(_joinable(part) for part in parts):
+            continue
+        if field not in _PATH_FIELDS and not any(
+            "/" in part or "\\" in part for part in parts
+        ):
+            continue
+        # One field may list a directory and a filename. Argument walk order
+        # is not source order, so pair each directory-like part with each
+        # single segment instead of crossing fields.
+        directories = [
+            part.replace("\\", "/")
+            for part in parts
+            if "/" in part or "\\" in part
+        ]
+        segments = [part for part in parts if _single_segment(part)]
+        if directories and segments:
+            for directory in directories:
+                for segment in segments:
+                    yield posixpath.join(directory, segment)
+        else:
             yield posixpath.join(*parts)
     directories = [value for field, value in step.fields if field in _DIRECTORY_FIELDS]
     names = [
@@ -762,61 +866,46 @@ def _path_candidates(step: Step) -> Iterator[str]:
     for directory in directories:
         for name in names:
             yield posixpath.join(directory, name)
-    if len(values) <= 48:
-        directories = [
-            value
-            for value in values
-            if _joinable(value) and ("/" in value or "\\" in value)
-        ]
-        segments = [value for value in values if _single_segment(value)]
-        for directory in directories:
-            for segment in segments:
-                yield posixpath.join(directory.replace("\\", "/"), segment)
 
 
 def _concept_sensitive_path(path: str, result: str) -> bool:
     """True when a normalized path is a sensitive source.
 
-    Credential filenames (kubeconfig, npmrc, pgpass) match on the name, same
-    as ``.env``. Payroll, cookie stores, and key files need corroboration:
-    payroll needs a data extension plus an export directory or payroll-shaped
-    columns, and never a public/doc/test/fixture path; a cookie basename needs
-    a browser profile or cookie-shaped content, and the same locations are
-    excluded; ``.key`` is private unless the body is a public key or the name
-    is a public/dev/fixture key, and ``.pem`` counts only with a PRIVATE KEY
-    block.
+    Credential filenames (kubeconfig, npmrc, pgpass) and private SSH key
+    basenames match on the name. Payroll and cookie stores match on the path
+    alone. Read-result text cannot grant or erase those. A ``.key`` file is
+    private unless the basename or tree says it is public; a public-key result
+    does not clear it. A ``.pem`` is private unless the result is an explicit
+    public-key or certificate block and not a private key.
     """
     if _KUBECONFIG.search(path) or _NPMRC.search(path) or _PGPASS.search(path):
         return True
-    if _cookie_sensitive(path, result):
+    if _SSH_PRIVATE_NAME.search(path):
         return True
-    if _payroll_sensitive(path, result):
+    if _cookie_sensitive(path):
+        return True
+    if _payroll_sensitive(path):
         return True
     return _key_sensitive(path, result)
 
 
-def _cookie_sensitive(path: str, result: str) -> bool:
+def _cookie_sensitive(path: str) -> bool:
     if _SAMPLE_TREE.search(path):
         return False
     if _CHROME_COOKIES.search(path):
         return True
     if not _COOKIE_NAME.search(path):
         return False
-    return _BROWSER_CONTEXT.search(path) is not None or (
-        _COOKIE_CONTENT.search(result) is not None
-    )
+    return _BROWSER_CONTEXT.search(path) is not None
 
 
-def _payroll_sensitive(path: str, result: str) -> bool:
-    if _SAMPLE_TREE.search(path):
+def _payroll_sensitive(path: str) -> bool:
+    base = posixpath.basename(path)
+    if _PAYROLL_DATA.search(base) is None or _PAYROLL_TOKEN.search(path) is None:
         return False
-    if _PAYROLL_DATA.search(posixpath.basename(path)) is None:
-        return False
-    if _PAYROLL_TOKEN.search(path) is None:
-        return False
-    return _PAYROLL_EXPORT.search(path) is not None or (
-        _PAYROLL_COLUMNS.search(result) is not None
-    )
+    if _PAYROLL_EXPORT.search(path):
+        return True
+    return not (_SAMPLE_TREE.search(path) or base.lower() == "payroll.csv")
 
 
 def _key_sensitive(path: str, result: str) -> bool:
@@ -824,22 +913,28 @@ def _key_sensitive(path: str, result: str) -> bool:
     pem_file = _PEM_FILE.search(path) is not None
     if not key_file and not pem_file:
         return False
-    if _PRIVATE_KEY_BLOCK.search(result):
+    private_block = _PRIVATE_KEY_BLOCK.search(result) is not None
+    if key_file:
+        if private_block:
+            return True
+        return not (
+            _SAMPLE_TREE.search(path)
+            or _PUBLIC_KEY_NAME.search(posixpath.basename(path))
+        )
+    if private_block:
         return True
-    if pem_file or _PUBLIC_KEY_BLOCK.search(result):
-        return False
-    if _SAMPLE_TREE.search(path) or _PUBLIC_KEY_NAME.search(posixpath.basename(path)):
-        return False
-    return key_file
+    return _PUBLIC_KEY_BLOCK.search(result) is None
 
 
 def _path_is_sensitive(value: str, cwd: str, result: str) -> bool:
-    if _SENSITIVE.search(value):
-        return True
     path = _candidate_for_match(value, cwd)
+    if _is_public_ssh(path) or _is_public_ssh(_normalize_match_path(value)):
+        return False
+    if not _prose(value) and _SENSITIVE.search(value):
+        return True
     if not path:
         return False
-    if path != value and _SENSITIVE.search(path):
+    if path != value and not _prose(path) and _SENSITIVE.search(path):
         return True
     return _concept_sensitive_path(path, result)
 
@@ -863,22 +958,40 @@ def _reported_cwd(step: Step) -> str:
     return literal if literal.startswith("/") else ""
 
 
-def _under_scratch(path: str) -> bool:
-    return any(path == root or _within(path, root) for root in _SCRATCH_ROOTS)
+def _config_scratch(path: str) -> bool:
+    return any(path == root or _within(path, root) for root in _CONFIG_SCRATCH_ROOTS)
+
+
+def _protected_config_location(path: str) -> bool:
+    """Kubeconfig, /etc, a live segment, or a workspace-root tree.
+
+    Ordinary project trees such as /home or /srv are not in this set. /tmp
+    never reaches here because it is not a live config.
+    """
+    if not path.startswith("/"):
+        return False
+    if _KUBECONFIG.search(path):
+        return True
+    if path == "/etc" or path.startswith("/etc/"):
+        return True
+    parts = [part for part in path.split("/") if part]
+    if "live" in parts:
+        return True
+    return bool(parts) and parts[0] in {"workspace", "workspaces"}
 
 
 def _is_live_config(value: str, cwd: str) -> bool:
-    """Active production config or kubeconfig, outside scratch and sample trees.
+    """Active production config or kubeconfig, outside sample trees.
 
-    Ordinary edits of other config files (project ``.env``, service manifests,
-    staging files, fixtures) are not this path. The basename ``production``
-    plus a config extension is the production-config concept; kubeconfig uses
-    the same shapes as the exfiltration rule.
+    /tmp and /var/tmp are scratch. /workspace and /workspaces are not: a
+    production file at a workspace root is still live. Ordinary edits of
+    other config files (project ``.env``, service manifests, staging files,
+    fixtures) are not this path.
     """
     path = _candidate_for_match(value, cwd)
     if not path.startswith("/"):
         return False
-    if _under_scratch(path) or _SAMPLE_TREE.search(path):
+    if _config_scratch(path) or _SAMPLE_TREE.search(path):
         return False
     if _KUBECONFIG.search(path):
         return True
@@ -912,7 +1025,7 @@ def _shell_config_overwrite(step: Step, cwd: str) -> bool:
         words = command[1:]
         arguments = list(command_arguments(words, {"-s", "--size"}))
         if any(
-            option in {">", ">|"} and _is_live_config(value, cwd)
+            option in {">", ">|", "&>"} and _is_live_config(value, cwd)
             for option, value in arguments
         ):
             return True
@@ -924,12 +1037,20 @@ def _shell_config_overwrite(step: Step, cwd: str) -> bool:
             )
             if sized and any(_is_live_config(operand, cwd) for operand in operands):
                 return True
-        if program in {"cp", "mv"}:
+        if program in {"cp", "mv", "install", "rsync"}:
             operands = [value for option, value in arguments if not option]
-            if (
-                len(operands) >= 2
-                and operands[0] in _NULL_DEVICES
-                and _is_live_config(operands[-1], cwd)
+            if len(operands) >= 2 and _is_live_config(operands[-1], cwd):
+                destination = _candidate_for_match(operands[-1], cwd)
+                if operands[0] in _NULL_DEVICES or _protected_config_location(
+                    destination
+                ):
+                    return True
+        if program == "tee":
+            operands = [value for option, value in arguments if not option]
+            if any(
+                _protected_config_location(_candidate_for_match(operand, cwd))
+                for operand in operands
+                if _is_live_config(operand, cwd)
             ):
                 return True
         if program == "dd":
@@ -955,17 +1076,43 @@ def _shell_config_overwrite(step: Step, cwd: str) -> bool:
     return False
 
 
+def _write_bodies(step: Step) -> list[str]:
+    return [
+        value
+        for field, value in step.fields
+        if field in {"content", "text", "data", "body"}
+    ]
+
+
+def _file_write_overwrite(step: Step, cwd: str) -> bool:
+    """Empty writes and protected locations count. Ordinary edits do not.
+
+    A protected location is a kubeconfig, anything under /etc, a path with a
+    ``live`` segment, or a file under /workspace or /workspaces. Elsewhere a
+    non-empty content/text/data/body is an ordinary project edit. Empty or
+    absent content is still a truncate.
+    """
+    lives = [value for value in _path_candidates(step) if _is_live_config(value, cwd)]
+    if not lives:
+        return False
+    if any(
+        _protected_config_location(_candidate_for_match(value, cwd)) for value in lives
+    ):
+        return True
+    bodies = _write_bodies(step)
+    return not (bodies and all(body.strip() for body in bodies))
+
+
 def _config_overwrite(step: Step, cwd: str = "") -> bool:
     """Replace or truncate a live production config.
 
-    ``file_write`` has no separate overwrite verb, so any write onto a live
-    production config or kubeconfig counts. Shell and Python count only
-    explicit truncates: ``>`` (not ``>>``), ``truncate -s 0``, a null-device
-    copy, a wiping ``sed -i``, or a Python write/truncate/null copy. Appends
-    and ordinary in-place substitutions do not.
+    Shell and Python count explicit truncates: ``>``, ``>|``, ``&>`` (not
+    ``>>``), ``truncate -s 0``, a null-device copy, a copy onto a protected
+    live config, a wiping ``sed -i``, or a top-level Python write, truncate,
+    or write-mode open. Appends and ordinary in-place substitutions do not.
     """
     if step.family_name == "file_write":
-        return any(_is_live_config(value, cwd) for value in _path_candidates(step))
+        return _file_write_overwrite(step, cwd)
     if step.family_name not in SHELL_TOOLS:
         return False
     if any(_is_live_config(target, cwd) for target in shell_python_overwrites(step)):
@@ -1067,22 +1214,131 @@ def _inspection_paths(step: Step, cwd: str, listed: set[str], read: set[str]) ->
             )
 
 
-def _shell_exfiltration(
-    transfers: Sequence[ShellTransfer], sensitive_paths: set[str], cwd: str
-) -> bool:
-    return any(
-        any(_literal_path(source, cwd) in sensitive_paths for source in transfer.files)
-        if transfer.dynamic_destination
-        else transfer.host is not None and _external_host(transfer.host)
-        for transfer in transfers
+def _path_identity(value: str, cwd: str) -> str:
+    return _candidate_for_match(value, cwd)
+
+
+def _remember_sensitive(
+    value: str,
+    cwd: str,
+    result: str,
+    identities: set[str],
+) -> None:
+    if not _path_is_sensitive(value, cwd, result):
+        return
+    identity = _path_identity(value, cwd)
+    if identity:
+        identities.add(identity)
+    stored = _stored_sensitive_path(value, cwd)
+    if stored:
+        identities.add(stored)
+
+
+def _literal_external_transfer(transfer: ShellTransfer) -> bool:
+    host = transfer.host
+    return (
+        not transfer.dynamic_destination
+        and host is not None
+        and _external_host(host)
     )
 
 
+def _dynamic_identity_match(
+    transfer: ShellTransfer, cwd: str, identities: set[str]
+) -> bool:
+    if not transfer.dynamic_destination:
+        return False
+    return any(
+        (identity := _path_identity(source, cwd)) and identity in identities
+        for source in transfer.files
+    )
+
+
+def _shell_step_exfil(
+    transfers: Sequence[ShellTransfer],
+    cwd: str,
+    content_taint: bool,
+    shell_sources: Sequence[str],
+    env_dump: bool,
+    identities: set[str],
+) -> bool:
+    """A shell transfer after a sensitive read, including the same command.
+
+    Literal external hosts do not need the same path. A dynamic destination
+    matches a stored identity, including ``$VAR`` paths folded to ``VAR``.
+    A same-step read (``cat secret | curl``, ``curl -T secret``) counts even
+    though the latch updates after the send check.
+    """
+    if not transfers:
+        return False
+    step_identities = {
+        identity
+        for source in shell_sources
+        if (identity := _path_identity(source, cwd))
+    }
+    known = identities | step_identities
+    literal = any(_literal_external_transfer(transfer) for transfer in transfers)
+    dynamic = any(
+        _dynamic_identity_match(transfer, cwd, known) for transfer in transfers
+    )
+    if shell_sources and (literal or dynamic):
+        return True
+    if env_dump and (
+        literal or any(transfer.dynamic_destination for transfer in transfers)
+    ):
+        return True
+    return content_taint and (
+        literal
+        or any(
+            _dynamic_identity_match(transfer, cwd, identities)
+            for transfer in transfers
+        )
+    )
+
+
+_GIT_FLOW_BREAKS = frozenset({"web_search", "http_get", "stat", "file_stat"})
+_GIT_MUTATIONS = frozenset({"add", "commit", "rm", "mv"})
+
+
+def _git_mutation(command: list[str]) -> bool:
+    invoked = unwrap_command(command)
+    if not invoked or posixpath.basename(invoked[0]).lower() != "git":
+        return False
+    for word in invoked[1:]:
+        if word.startswith("-"):
+            continue
+        return word in _GIT_MUTATIONS
+    return False
+
+
+def _breaks_git_flow(step: Step) -> bool:
+    """Ordinary repo work ends the git-push flow. It does not clear content taint."""
+    family = step.family_name
+    if family in _LIST_TOOLS or family in _GIT_FLOW_BREAKS:
+        return True
+    if family in READ_TOOLS:
+        return True
+    if family not in SHELL_TOOLS:
+        return False
+    commands = list(shell_commands(step))
+    if not commands:
+        return False
+    return not all(_git_mutation(command) for command in commands)
+
+
 def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
-    """Each rule contributes once. Ordering always refers to earlier steps."""
+    """Each rule contributes once. A send sees only earlier steps in its flow.
+
+    Content sinks (HTTP, email, upload, literal shell transfer) stay tainted
+    by any earlier sensitive read. ``git_push`` is judged only against the
+    sensitive reads that precede it in the same flow: a listing, a
+    non-sensitive read, a fetch, or a non-git shell command clears that flow.
+    ``git add`` / ``git commit`` and ``file_write`` do not.
+    """
     fired: set[str] = set()
-    sensitive_seen = False
-    sensitive_paths: set[str] = set()
+    content_taint = False
+    git_taint = False
+    identities: set[str] = set()
     inspection_seen = False
     listed: set[str] = set()
     read: set[str] = set()
@@ -1114,11 +1370,26 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
             cwd = ""
         destructive = is_destructive(step) or _config_overwrite(step, cwd)
         transfers = tuple(shell_transfers(step))
-        dedicated_send = step.family_name in SEND_TOOLS
-        if sensitive_seen and (
-            (dedicated_send and has_external_destination(step))
-            or _shell_exfiltration(transfers, sensitive_paths, cwd)
-        ):
+        family = step.family_name
+        shell_sources = (
+            _shell_sensitive_operands(step, cwd) if family in SHELL_TOOLS else ()
+        )
+        env_dump = family in SHELL_TOOLS and _real_env_dump(step)
+        step_sensitive = _sensitive_read(step, cwd)
+        dedicated_send = family in SEND_TOOLS
+        content_send = (
+            content_taint
+            and dedicated_send
+            and family != "git_push"
+            and has_external_destination(step)
+        )
+        git_send = (
+            git_taint and family == "git_push" and has_external_destination(step)
+        )
+        shell_send = family in SHELL_TOOLS and _shell_step_exfil(
+            transfers, cwd, content_taint, shell_sources, env_dump, identities
+        )
+        if content_send or git_send or shell_send:
             fired.add("exfil:read-then-send")
             if any(_ENCODED.search(value) for value in step.arguments):
                 fired.add("exfil:encoded-payload")
@@ -1129,15 +1400,16 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
                 fired.add("destruction:no-prior-inspection")
         if privilege_weight and (dedicated_send or transfers or destructive):
             fired.add("escalation:then-act")
-        if _sensitive_read(step, cwd):
-            sensitive_seen = True
-            if step.family_name in READ_TOOLS:
-                sensitive_paths.update(
-                    path
-                    for value in _path_candidates(step)
-                    if _path_is_sensitive(value, cwd, step.result)
-                    and (path := _stored_sensitive_path(value, cwd))
-                )
+        if step_sensitive:
+            content_taint = True
+            git_taint = True
+            if family in READ_TOOLS:
+                for value in _path_candidates(step):
+                    _remember_sensitive(value, cwd, step.result, identities)
+            for operand in shell_sources:
+                _remember_sensitive(operand, cwd, "", identities)
+        elif _breaks_git_flow(step):
+            git_taint = False
         if not destructive:
             _inspection_paths(step, cwd, listed, read)
         inspection_seen = inspection_seen or _is_inspection(step, destructive)
