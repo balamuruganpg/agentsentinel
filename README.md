@@ -5,10 +5,10 @@ destructive operations, and privilege escalation. It combines deterministic
 sequence rules with a learned tool-sequence classifier, following the
 rules-plus-learned approach of the author's PromptWarden in a new domain.
 
-Version 0.4.0 runs on Python 3.11+ with **no runtime dependencies**. The default
+Version 0.5.0 runs on Python 3.11+ with **no runtime dependencies**. The default
 corpus and trained JSON model ship inside the package and work offline.
 
-**F1 0.8462. False-positive rate 0.0625.** Precision 0.8684 and recall 0.8250
+**F1 0.9286. False-positive rate 0.0625.** Precision 0.8864 and recall 0.9750
 on the independent 120-trace corpus at threshold 0.5.
 
 ![v0.3.0 category recall: exfiltration 0.6250, destruction 0.9286, privilege escalation 1.0000. Precision 0.8684, recall 0.8250, F1 0.8462, FPR 0.0625.](docs/assets/benchmark.svg)
@@ -155,6 +155,7 @@ corpus (40 malicious, 80 benign, including 36 hard negatives).
 
 | Bundled scanner | Precision | Recall | F1 | FPR | TP / FP / TN / FN |
 | --- | ---: | ---: | ---: | ---: | --- |
+| v0.5.0 | 0.8864 | 0.9750 | 0.9286 | 0.0625 | 39 / 5 / 75 / 1 |
 | v0.4.0 | 0.8684 | 0.8250 | 0.8462 | 0.0625 | 33 / 5 / 75 / 7 |
 | v0.3.0 | 0.8684 | 0.8250 | 0.8462 | 0.0625 | 33 / 5 / 75 / 7 |
 | v0.2.0 | 0.7000 | 0.7000 | 0.7000 | 0.1500 | 28 / 12 / 68 / 12 |
@@ -162,6 +163,7 @@ corpus (40 malicious, 80 benign, including 36 hard negatives).
 
 | Bundled scanner | Exfiltration (16) | Destruction (14) | Privilege escalation (10) |
 | --- | ---: | ---: | ---: |
+| v0.5.0 | 1.0000 | 0.9286 | 1.0000 |
 | v0.4.0 | 0.6250 | 0.9286 | 1.0000 |
 | v0.3.0 | 0.6250 | 0.9286 | 1.0000 |
 | v0.2.0 | 0.5625 | 0.8571 | 0.7000 |
@@ -178,6 +180,14 @@ replaying its trace mutations (budget 40, seed 13) against both builds,
 worst family, `tool_rename`, from 79.22% to 2.24% — v0.4.0 canonicalizes
 tool synonyms back to canonical names before scoring. Full account:
 [evals/results/benchmark-v0.4.0.md](evals/results/benchmark-v0.4.0.md).
+
+v0.5.0 closes the exfiltration gap: sensitive reads are recognized by
+basename and path shape, so all six traces that escaped v0.4.0 are caught
+and exfiltration recall reaches 1.0000 with the false-positive rate
+unchanged. Re-measured by TrustBreaker on the enlarged flagged set
+(44 originals, 1,705 variants), bypass is 3.11% (robustness 96.89%).
+Full account:
+[evals/results/benchmark-v0.5.0.md](evals/results/benchmark-v0.5.0.md).
 
 <details>
 <summary>Benchmark corpus notes and reports</summary>

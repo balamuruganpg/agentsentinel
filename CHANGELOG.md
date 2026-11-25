@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0
+
+- Recognize sensitive reads by basename and path shape (kubeconfig, browser
+  cookie stores, payroll exports, npm and PostgreSQL credential files, TLS
+  private keys under generic filenames), so a sensitive read followed by an
+  outbound transfer is caught even when the filename alone carried the
+  signal. Generic config files, debug logs, package manifests, SQL dumps,
+  and certificates stay ordinary — the false-positive rate does not move.
+- Independent benchmark: exfiltration recall 0.6250 -> 1.0000 (16/16),
+  F1 0.8462 -> 0.9286, recall 0.8250 -> 0.9750, FPR unchanged at 0.0625.
+- TrustBreaker trace evasion re-measured on this build: bypass 3.11%,
+  robustness 96.89% (v0.4.0: 2.94% / 97.06% on fewer flagged originals).
+
 ## 0.4.0
 
 - Canonicalize known tool synonyms in normalized trace steps before applying

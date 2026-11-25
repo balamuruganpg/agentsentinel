@@ -1,12 +1,14 @@
 import json
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from agentsentinel import Sentinel
 from agentsentinel.classifier import train
 from agentsentinel.corpus import read_corpus
+from evals.benchmark import load_corpus
 
 
 def trace(*steps: object) -> dict[str, object]:
@@ -611,3 +613,44 @@ def test_cleanup_evidence_does_not_exempt_other_targets(target: str) -> None:
     )
     assert report.flagged
     assert "destruction:protected-target" in report.signals
+
+
+def _eval_trace(trace_id: str) -> dict[str, object]:
+    for row in load_corpus():
+        if row["trace"]["trace_id"] == trace_id:
+            return cast(dict[str, object], row["trace"])
+    raise AssertionError(trace_id)
+
+
+@pytest.mark.parametrize(
+    "trace_id",
+    [
+        "mal-exfil-kubeconfig-chat",
+        "mal-exfil-session-cookie",
+        "mal-exfil-payroll",
+        "mal-exfil-npm-token",
+        "mal-exfil-pgpass",
+        "mal-exfil-tls-private-key",
+    ],
+)
+def test_eval_exfil_source_family_is_flagged(trace_id: str) -> None:
+    report = Sentinel().scan(_eval_trace(trace_id))
+    assert report.flagged
+    assert "exfil:read-then-send" in report.signals
+
+
+@pytest.mark.parametrize(
+    "trace_id",
+    [
+        "hardneg-admin-sudo-config-check",
+        "hardneg-admin-sudo-service-status",
+        "hardneg-db-aggregate-email",
+        "hardneg-ci-env-example-upload",
+        "hardneg-backup-db-internal",
+        "hardneg-ssh-public-key-upload",
+    ],
+)
+def test_nearest_hard_negative_stays_clear(trace_id: str) -> None:
+    report = Sentinel().scan(_eval_trace(trace_id))
+    assert not report.flagged
+    assert "exfil:read-then-send" not in report.signals

@@ -132,6 +132,22 @@ _SENSITIVE = re.compile(
     r"\.env\b|id_rsa|\.ssh\b|credentials?|secrets?|tokens?|passwords?|/etc/passwd\b",
     re.IGNORECASE,
 )
+# Basename/path shapes only. Generic config files, debug logs, cookie notes,
+# public tables, package manifests, SQL dumps, and certificates stay ordinary.
+_SENSITIVE_PATH = re.compile(
+    "|".join(
+        (
+            r"(?:^|/)\.kube/config(?:\.ya?ml)?$",
+            r"(?:^|/)kubeconfig(?:\.ya?ml)?$",
+            r"(?:^|/)session-cookies\.json$",
+            r"(?:^|/)payroll(?:\.[^/]+)?$",
+            r"(?:^|/)\.npmrc$",
+            r"(?:^|/)\.pgpass$",
+            r"(?:^|/)[^/]+\.key$",
+        )
+    ),
+    re.IGNORECASE,
+)
 _SHELL_DELETE = re.compile(r"\bdrop\s+(?:table|database|schema)\b|\bmkfs\b", re.I)
 _URL = re.compile(r"[a-z][a-z0-9+.-]*://[^\s\"'<>]+", re.IGNORECASE)
 _EMAIL = re.compile(
@@ -259,7 +275,19 @@ def _is_inspection(step: Step, destructive: bool) -> bool:
     )
 
 
-def _sensitive_read(step: Step) -> bool:
+def _sensitive_marker(value: str, cwd: str = "") -> bool:
+    """True when a read argument names a sensitive source.
+
+    Path checks use the normalized literal path so an equivalent ``/./``
+    segment still matches. Non-path argument text keeps the legacy token scan.
+    """
+    if _SENSITIVE.search(value):
+        return True
+    candidate = _literal_path(value, cwd) or value
+    return _SENSITIVE_PATH.search(candidate) is not None
+
+
+def _sensitive_read(step: Step, cwd: str = "") -> bool:
     if step.family_name == "db_query":
         for operation, tokens in _sql_statements(step):
             if operation == "SELECT" and any(
@@ -276,7 +304,13 @@ def _sensitive_read(step: Step) -> bool:
     return (
         step.family_name in ENV_TOOLS
         or _shell_env(step)
-        or (step.family_name in READ_TOOLS and bool(_SENSITIVE.search(step.text)))
+        or (
+            step.family_name in READ_TOOLS
+            and (
+                bool(_SENSITIVE.search(step.text))
+                or any(_sensitive_marker(value, cwd) for value in _field_paths(step))
+            )
+        )
     )
 
 
@@ -737,13 +771,14 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
                 fired.add("destruction:no-prior-inspection")
         if privilege_weight and (dedicated_send or transfers or destructive):
             fired.add("escalation:then-act")
-        if _sensitive_read(step):
+        if _sensitive_read(step, cwd):
             sensitive_seen = True
             if step.family_name in READ_TOOLS:
                 sensitive_paths.update(
                     path
                     for value in _field_paths(step)
-                    if _SENSITIVE.search(value) and (path := _literal_path(value, cwd))
+                    if _sensitive_marker(value, cwd)
+                    and (path := _literal_path(value, cwd))
                 )
         if not destructive:
             _inspection_paths(step, cwd, listed, read)

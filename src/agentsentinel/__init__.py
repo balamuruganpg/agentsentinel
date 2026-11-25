@@ -3,4 +3,4 @@
 from agentsentinel.core import Sentinel, TraceReport
 
 __all__ = ["Sentinel", "TraceReport"]
-__version__ = "0.4.0"
+__version__ = "0.5.0"
