@@ -5,10 +5,10 @@ destructive operations, and privilege escalation. It combines deterministic
 sequence rules with a learned tool-sequence classifier, following the
 rules-plus-learned approach of the author's PromptWarden in a new domain.
 
-Version 0.5.0 runs on Python 3.11+ with **no runtime dependencies**. The default
+Version 0.6.0 runs on Python 3.11+ with **no runtime dependencies**. The default
 corpus and trained JSON model ship inside the package and work offline.
 
-**F1 0.9286. False-positive rate 0.0625.** Precision 0.8864 and recall 0.9750
+**F1 0.9412. False-positive rate 0.0625.** Precision 0.8889 and recall 1.0000
 on the independent 120-trace corpus at threshold 0.5.
 
 ![v0.3.0 category recall: exfiltration 0.6250, destruction 0.9286, privilege escalation 1.0000. Precision 0.8684, recall 0.8250, F1 0.8462, FPR 0.0625.](docs/assets/benchmark.svg)
@@ -117,7 +117,7 @@ flowchart TD
 
 | Area | What it does |
 | --- | --- |
-| Rules | Detect sensitive reads followed by sends through dedicated tools or shell transfers, protected deletion including literal Python calls, database mutations, and explicit privilege grants. |
+| Rules | Detect sensitive reads followed by sends through dedicated tools or shell transfers, protected deletion including literal Python calls, explicit truncation of a live production config, database mutations, and explicit privilege grants. |
 | Classifier | Scores binary tool-name unigrams and bigrams, tool-family presence, and trace length using stdlib logistic regression. |
 | CLI | `scan` emits text or JSON, `train` writes a local model, and `eval` measures the complete pipeline. |
 | Evals | Reports precision, recall, F1, false-positive rate, confusion counts, and per-category recall on the independent corpus. |
@@ -130,7 +130,8 @@ standalone high-risk privilege operation contributes 0.55. Routine `sudo`
 maintenance contributes 0.20. Exfiltration evidence includes external
 destinations and shell transfers that name a previously read sensitive file
 with an unresolved destination. Database query results supply sensitive-read
-evidence. [Complete rule weights and triggers](SPEC.md#deterministic-rules)
+evidence, and a file-read body can corroborate payroll columns or a private
+key. [Complete rule weights and triggers](SPEC.md#deterministic-rules)
 
 </details>
 
@@ -155,6 +156,7 @@ corpus (40 malicious, 80 benign, including 36 hard negatives).
 
 | Bundled scanner | Precision | Recall | F1 | FPR | TP / FP / TN / FN |
 | --- | ---: | ---: | ---: | ---: | --- |
+| v0.6.0 | 0.8889 | 1.0000 | 0.9412 | 0.0625 | 40 / 5 / 75 / 0 |
 | v0.5.0 | 0.8864 | 0.9750 | 0.9286 | 0.0625 | 39 / 5 / 75 / 1 |
 | v0.4.0 | 0.8684 | 0.8250 | 0.8462 | 0.0625 | 33 / 5 / 75 / 7 |
 | v0.3.0 | 0.8684 | 0.8250 | 0.8462 | 0.0625 | 33 / 5 / 75 / 7 |
@@ -163,6 +165,7 @@ corpus (40 malicious, 80 benign, including 36 hard negatives).
 
 | Bundled scanner | Exfiltration (16) | Destruction (14) | Privilege escalation (10) |
 | --- | ---: | ---: | ---: |
+| v0.6.0 | 1.0000 | 1.0000 | 1.0000 |
 | v0.5.0 | 1.0000 | 0.9286 | 1.0000 |
 | v0.4.0 | 0.6250 | 0.9286 | 1.0000 |
 | v0.3.0 | 0.6250 | 0.9286 | 1.0000 |
@@ -188,6 +191,16 @@ unchanged. Re-measured by TrustBreaker on the enlarged flagged set
 (44 originals, 1,705 variants), bypass is 3.11% (robustness 96.89%).
 Full account:
 [evals/results/benchmark-v0.5.0.md](evals/results/benchmark-v0.5.0.md).
+
+v0.6.0 gathers sensitive paths from every argument string, normalizes them,
+and asks for corroboration before a payroll file, cookie store, or key file
+counts. Near-neighbor spellings of the six families are covered, and an
+explicit overwrite of a live production config is destruction. Destruction
+recall rises from 0.9286 to 1.0000 (14/14), F1 from 0.9286 to 0.9412, and
+the false-positive rate stays 0.0625. The classifier was not refit.
+Re-measured by TrustBreaker on 45 flagged originals and 1,745 variants,
+bypass is 3.04% (robustness 96.96%). Full account:
+[evals/results/benchmark-v0.6.0.md](evals/results/benchmark-v0.6.0.md).
 
 <details>
 <summary>Benchmark corpus notes and reports</summary>

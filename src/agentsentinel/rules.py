@@ -5,7 +5,7 @@ import posixpath
 import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from agentsentinel._shell import (
     COMMAND_FIELDS,
@@ -13,6 +13,7 @@ from agentsentinel._shell import (
     ShellTransfer,
     command_arguments,
     shell_commands,
+    shell_python_overwrites,
     shell_python_targets,
     shell_transfers,
     unwrap_command,
@@ -89,6 +90,12 @@ _CUSTOMER_IDENTIFIER = re.compile(
     r"(?:$|[_-])",
     re.I,
 )
+# Payroll is a compensation concept, not the customer-table rule. `payroll_export`
+# matches because the token boundary allows a trailing `_`.
+_PAYROLL_IDENTIFIER = re.compile(
+    r"(?:^|[_-])(?:payrolls?|salaries|salary|wages?|compensations?|ibans?)(?:$|[_-])",
+    re.I,
+)
 _SECRET_RESULT = re.compile(
     rf"\b(?:{_SECRET_NAME})[\"']?\s*[:=]\s*[\"']?[^\s\"',;}}\]]"
     r"|-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
@@ -132,22 +139,88 @@ _SENSITIVE = re.compile(
     r"\.env\b|id_rsa|\.ssh\b|credentials?|secrets?|tokens?|passwords?|/etc/passwd\b",
     re.IGNORECASE,
 )
-# Basename/path shapes only. Generic config files, debug logs, cookie notes,
-# public tables, package manifests, SQL dumps, and certificates stay ordinary.
-_SENSITIVE_PATH = re.compile(
+# Concept shapes. Matching is against one normalized path string, never a
+# substring of a sentence. Generic configs, manifests, certificates, and
+# public tables stay ordinary; see the corroboration helpers below.
+_KUBECONFIG = re.compile(
     "|".join(
         (
-            r"(?:^|/)\.kube/config(?:\.ya?ml)?$",
-            r"(?:^|/)kubeconfig(?:\.ya?ml)?$",
-            r"(?:^|/)session-cookies\.json$",
-            r"(?:^|/)payroll(?:\.[^/]+)?$",
-            r"(?:^|/)\.npmrc$",
-            r"(?:^|/)\.pgpass$",
-            r"(?:^|/)[^/]+\.key$",
+            r"(?:^|/)\.kube/(?:config|admin\.conf)(?:\.(?:ya?ml|json|bak|old))?$",
+            r"(?:^|/)[^/]*kubeconfig(?:\.(?:ya?ml|json|bak|old))?$",
+            r"(?:^|/)kubernetes/(?:admin|kubelet|controller-manager|scheduler)\.conf$",
         )
     ),
     re.IGNORECASE,
 )
+_NPMRC = re.compile(
+    r"(?:^|/)(?:\.)?npmrc(?:\.(?:bak|old|backup|save))?$",
+    re.IGNORECASE,
+)
+_PGPASS = re.compile(
+    r"(?:^|/)(?:\.)?pgpass(?:\.(?:conf|bak|old))?$",
+    re.IGNORECASE,
+)
+_COOKIE_NAME = re.compile(
+    r"(?:^|/)(?:session[-_]cookies?\.json|cookies\.(?:sqlite|json))$",
+    re.IGNORECASE,
+)
+_CHROME_COOKIES = re.compile(
+    r"(?:^|/)(?:google-chrome|chromium|microsoft-edge|brave(?:-browser)?)"
+    r"/(?:default|profile[^/]*|system profile|guest profile)/cookies$",
+    re.IGNORECASE,
+)
+_BROWSER_CONTEXT = re.compile(
+    r"(?:^|/)(?:\.config/browser|google-chrome|chromium|microsoft-edge|"
+    r"brave(?:-browser)?|firefox|\.mozilla)(?:/|$)",
+    re.IGNORECASE,
+)
+_COOKIE_CONTENT = re.compile(
+    r"(\bdomain\b.+\b(?:session|cookie)\b|\b(?:session|cookie)\b.+\bdomain\b"
+    r"|set-cookie)",
+    re.IGNORECASE | re.DOTALL,
+)
+_PAYROLL_TOKEN = re.compile(r"(?<![a-z0-9])payroll(?![a-z0-9])", re.IGNORECASE)
+_PAYROLL_DATA = re.compile(
+    r"\.(?:csv|tsv|json|ndjson|xlsx?|parquet)$",
+    re.IGNORECASE,
+)
+_PAYROLL_EXPORT = re.compile(
+    r"(?:^|/)(?:private|exports?|confidential|secrets?|hr|payroll|compensation|"
+    r"salaries)(?:/|$)",
+    re.IGNORECASE,
+)
+_PAYROLL_COLUMNS = re.compile(
+    r"\b(?:salary|salaries|iban|bank_account|compensation|wages?)\b",
+    re.IGNORECASE,
+)
+# Public, documentation, and fixture trees do not make a basename sensitive.
+_SAMPLE_TREE = re.compile(
+    r"(?:^|/)(?:public|docs?|tests?|fixtures?|examples?|samples?|demos?)(?:/|$)",
+    re.IGNORECASE,
+)
+_KEY_FILE = re.compile(r"(?:^|/)[^/]+\.key$", re.IGNORECASE)
+_PEM_FILE = re.compile(r"(?:^|/)[^/]+\.pem$", re.IGNORECASE)
+_PRIVATE_KEY_BLOCK = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----",
+    re.IGNORECASE,
+)
+_PUBLIC_KEY_BLOCK = re.compile(
+    r"-----BEGIN (?:[A-Z0-9 ]*PUBLIC KEY|CERTIFICATE)-----",
+    re.IGNORECASE,
+)
+_PUBLIC_KEY_NAME = re.compile(r"public|localhost|example", re.IGNORECASE)
+_PRODUCTION_CONFIG = re.compile(
+    r"^production\.(?:ya?ml|json|toml|ini|conf|cfg|config)$",
+    re.IGNORECASE,
+)
+_SHELL_VAR = re.compile(r"\$\{[^}\0]*\}|\$[A-Za-z_][A-Za-z0-9_]*")
+_WIPE_SUBSTITUTION = re.compile(r"s(.)(\^?\.\*\$?|\.\+|\^.*\$)\1\1([g0-9]*)")
+_ZERO_SIZE = re.compile(r"0+[bBkKmMgG]?$")
+_DIRECTORY_FIELDS = frozenset(
+    {"directory", "dir", "folder", "dirname", "parent", "dir_path", "folder_path"}
+)
+_FILENAME_FIELDS = frozenset({"filename", "file", "basename", "file_name", "name"})
+_NULL_DEVICES = {"/dev/null", "/dev/zero"}
 _SHELL_DELETE = re.compile(r"\bdrop\s+(?:table|database|schema)\b|\bmkfs\b", re.I)
 _URL = re.compile(r"[a-z][a-z0-9+.-]*://[^\s\"'<>]+", re.IGNORECASE)
 _EMAIL = re.compile(
@@ -257,6 +330,7 @@ def is_destructive(step: Step) -> bool:
         step.family_name in DESTRUCTIVE_TOOLS
         or _shell_always_protected(step)
         or bool(_shell_deletion_targets(step))
+        or _config_overwrite(step, _reported_cwd(step))
     )
 
 
@@ -275,23 +349,13 @@ def _is_inspection(step: Step, destructive: bool) -> bool:
     )
 
 
-def _sensitive_marker(value: str, cwd: str = "") -> bool:
-    """True when a read argument names a sensitive source.
-
-    Path checks use the normalized literal path so an equivalent ``/./``
-    segment still matches. Non-path argument text keeps the legacy token scan.
-    """
-    if _SENSITIVE.search(value):
-        return True
-    candidate = _literal_path(value, cwd) or value
-    return _SENSITIVE_PATH.search(candidate) is not None
-
-
 def _sensitive_read(step: Step, cwd: str = "") -> bool:
     if step.family_name == "db_query":
         for operation, tokens in _sql_statements(step):
             if operation == "SELECT" and any(
-                _SECRET_IDENTIFIER.search(name) or _CUSTOMER_IDENTIFIER.search(name)
+                _SECRET_IDENTIFIER.search(name)
+                or _CUSTOMER_IDENTIFIER.search(name)
+                or _PAYROLL_IDENTIFIER.search(name)
                 for name in tokens
                 if name and not name.startswith("'")
             ):
@@ -307,8 +371,12 @@ def _sensitive_read(step: Step, cwd: str = "") -> bool:
         or (
             step.family_name in READ_TOOLS
             and (
+                # Legacy tokens still match any argument text, including keys.
                 bool(_SENSITIVE.search(step.text))
-                or any(_sensitive_marker(value, cwd) for value in _field_paths(step))
+                or any(
+                    _path_is_sensitive(value, cwd, step.result)
+                    for value in _path_candidates(step)
+                )
             )
         )
     )
@@ -623,6 +691,288 @@ def _literal_path(value: str, cwd: str = "") -> str:
     return posixpath.normpath("/" + path.lstrip("/") if path.startswith("/") else path)
 
 
+def _normalize_match_path(value: str) -> str:
+    """Fold literal-path quirks before a concept pattern runs.
+
+    Trailing whitespace and control characters, a NUL and anything after it,
+    backslashes, and percent-encoded dots are removed the way a legacy
+    ``.env`` token survives inside a longer string. Shell variables become a
+    placeholder segment so ``..`` still folds when ``$`` is present.
+    """
+    value = value.split("\0", 1)[0]
+    value = value.strip()
+    value = value.strip("".join(chr(code) for code in (*range(32), 127)))
+    if not value:
+        return ""
+    value = unquote(value.replace("\\", "/"))
+    value = _SHELL_VAR.sub("VAR", value)
+    absolute = value.startswith("/")
+    normalized = posixpath.normpath(value)
+    if absolute and not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return normalized
+
+
+def _candidate_for_match(value: str, cwd: str) -> str:
+    normalized = _normalize_match_path(value)
+    if not normalized:
+        return ""
+    relative = not normalized.startswith("/")
+    if cwd and relative and "VAR" not in normalized.split("/", 1)[0]:
+        return _normalize_match_path(posixpath.join(cwd, normalized))
+    return normalized
+
+
+def _joinable(value: str) -> bool:
+    return (
+        bool(value) and len(value) <= 1024 and not any(char.isspace() for char in value)
+    )
+
+
+def _single_segment(value: str) -> bool:
+    return (
+        _joinable(value)
+        and "/" not in value
+        and "\\" not in value
+        and not value.startswith("-")
+    )
+
+
+def _path_candidates(step: Step) -> Iterator[str]:
+    """Every argument string, plus directory and filename pieces joined.
+
+    The key name is not evidence. A path under ``file_path``, ``source``, or a
+    nested leaf counts the same as one under ``path``. A list of segments and
+    a directory field plus a filename field are joined before matching.
+    """
+    values = [value for _field, value in step.fields]
+    yield from values
+    grouped: dict[str, list[str]] = {}
+    for field, value in step.fields:
+        grouped.setdefault(field, []).append(value)
+    for parts in grouped.values():
+        if len(parts) >= 2 and all(_joinable(part) for part in parts):
+            yield posixpath.join(*parts)
+    directories = [value for field, value in step.fields if field in _DIRECTORY_FIELDS]
+    names = [
+        value
+        for field, value in step.fields
+        if field in _FILENAME_FIELDS and _single_segment(value)
+    ]
+    for directory in directories:
+        for name in names:
+            yield posixpath.join(directory, name)
+    if len(values) <= 48:
+        directories = [
+            value
+            for value in values
+            if _joinable(value) and ("/" in value or "\\" in value)
+        ]
+        segments = [value for value in values if _single_segment(value)]
+        for directory in directories:
+            for segment in segments:
+                yield posixpath.join(directory.replace("\\", "/"), segment)
+
+
+def _concept_sensitive_path(path: str, result: str) -> bool:
+    """True when a normalized path is a sensitive source.
+
+    Credential filenames (kubeconfig, npmrc, pgpass) match on the name, same
+    as ``.env``. Payroll, cookie stores, and key files need corroboration:
+    payroll needs a data extension plus an export directory or payroll-shaped
+    columns, and never a public/doc/test/fixture path; a cookie basename needs
+    a browser profile or cookie-shaped content, and the same locations are
+    excluded; ``.key`` is private unless the body is a public key or the name
+    is a public/dev/fixture key, and ``.pem`` counts only with a PRIVATE KEY
+    block.
+    """
+    if _KUBECONFIG.search(path) or _NPMRC.search(path) or _PGPASS.search(path):
+        return True
+    if _cookie_sensitive(path, result):
+        return True
+    if _payroll_sensitive(path, result):
+        return True
+    return _key_sensitive(path, result)
+
+
+def _cookie_sensitive(path: str, result: str) -> bool:
+    if _SAMPLE_TREE.search(path):
+        return False
+    if _CHROME_COOKIES.search(path):
+        return True
+    if not _COOKIE_NAME.search(path):
+        return False
+    return _BROWSER_CONTEXT.search(path) is not None or (
+        _COOKIE_CONTENT.search(result) is not None
+    )
+
+
+def _payroll_sensitive(path: str, result: str) -> bool:
+    if _SAMPLE_TREE.search(path):
+        return False
+    if _PAYROLL_DATA.search(posixpath.basename(path)) is None:
+        return False
+    if _PAYROLL_TOKEN.search(path) is None:
+        return False
+    return _PAYROLL_EXPORT.search(path) is not None or (
+        _PAYROLL_COLUMNS.search(result) is not None
+    )
+
+
+def _key_sensitive(path: str, result: str) -> bool:
+    key_file = _KEY_FILE.search(path) is not None
+    pem_file = _PEM_FILE.search(path) is not None
+    if not key_file and not pem_file:
+        return False
+    if _PRIVATE_KEY_BLOCK.search(result):
+        return True
+    if pem_file or _PUBLIC_KEY_BLOCK.search(result):
+        return False
+    if _SAMPLE_TREE.search(path) or _PUBLIC_KEY_NAME.search(posixpath.basename(path)):
+        return False
+    return key_file
+
+
+def _path_is_sensitive(value: str, cwd: str, result: str) -> bool:
+    if _SENSITIVE.search(value):
+        return True
+    path = _candidate_for_match(value, cwd)
+    if not path:
+        return False
+    if path != value and _SENSITIVE.search(path):
+        return True
+    return _concept_sensitive_path(path, result)
+
+
+def _stored_sensitive_path(value: str, cwd: str) -> str:
+    path = _candidate_for_match(value, cwd)
+    if (
+        path.startswith("/")
+        and "VAR" not in path
+        and _NON_LITERAL_PATH.isdisjoint(path)
+    ):
+        return path
+    return _literal_path(value, cwd)
+
+
+def _reported_cwd(step: Step) -> str:
+    reported = next((value for field, value in step.fields if field == "cwd"), "")
+    if not reported:
+        return ""
+    literal = _literal_path(reported)
+    return literal if literal.startswith("/") else ""
+
+
+def _under_scratch(path: str) -> bool:
+    return any(path == root or _within(path, root) for root in _SCRATCH_ROOTS)
+
+
+def _is_live_config(value: str, cwd: str) -> bool:
+    """Active production config or kubeconfig, outside scratch and sample trees.
+
+    Ordinary edits of other config files (project ``.env``, service manifests,
+    staging files, fixtures) are not this path. The basename ``production``
+    plus a config extension is the production-config concept; kubeconfig uses
+    the same shapes as the exfiltration rule.
+    """
+    path = _candidate_for_match(value, cwd)
+    if not path.startswith("/"):
+        return False
+    if _under_scratch(path) or _SAMPLE_TREE.search(path):
+        return False
+    if _KUBECONFIG.search(path):
+        return True
+    return _PRODUCTION_CONFIG.fullmatch(posixpath.basename(path)) is not None
+
+
+def _zero_size(value: str) -> bool:
+    return _ZERO_SIZE.fullmatch(value) is not None
+
+
+def _wiping_sed(words: list[str]) -> bool:
+    if not any(
+        word == "-i"
+        or word == "--in-place"
+        or word.startswith("--in-place=")
+        or (word.startswith("-i") and not word.startswith("--"))
+        for word in words
+    ):
+        return False
+    return any(
+        _WIPE_SUBSTITUTION.fullmatch(word.strip("'\"")) is not None for word in words
+    )
+
+
+def _shell_config_overwrite(step: Step, cwd: str) -> bool:
+    for raw_command in shell_commands(step):
+        command = unwrap_command(raw_command)
+        if not command:
+            continue
+        program = posixpath.basename(command[0]).lower()
+        words = command[1:]
+        arguments = list(command_arguments(words, {"-s", "--size"}))
+        if any(
+            option in {">", ">|"} and _is_live_config(value, cwd)
+            for option, value in arguments
+        ):
+            return True
+        if program == "truncate":
+            operands = [value for option, value in arguments if not option]
+            sized = any(
+                option in {"-s", "--size"} and _zero_size(value)
+                for option, value in arguments
+            )
+            if sized and any(_is_live_config(operand, cwd) for operand in operands):
+                return True
+        if program in {"cp", "mv"}:
+            operands = [value for option, value in arguments if not option]
+            if (
+                len(operands) >= 2
+                and operands[0] in _NULL_DEVICES
+                and _is_live_config(operands[-1], cwd)
+            ):
+                return True
+        if program == "dd":
+            params: dict[str, str] = {}
+            for option, token in arguments:
+                if option or "=" not in token:
+                    continue
+                key, _, value = token.partition("=")
+                params[key] = value
+            if params.get("if") in _NULL_DEVICES and _is_live_config(
+                params.get("of", ""), cwd
+            ):
+                return True
+        if program == "sed" and _wiping_sed(words):
+            operands = [
+                word
+                for word in words
+                if not word.startswith("-")
+                and _WIPE_SUBSTITUTION.fullmatch(word.strip("'\"")) is None
+            ]
+            if any(_is_live_config(operand, cwd) for operand in operands):
+                return True
+    return False
+
+
+def _config_overwrite(step: Step, cwd: str = "") -> bool:
+    """Replace or truncate a live production config.
+
+    ``file_write`` has no separate overwrite verb, so any write onto a live
+    production config or kubeconfig counts. Shell and Python count only
+    explicit truncates: ``>`` (not ``>>``), ``truncate -s 0``, a null-device
+    copy, a wiping ``sed -i``, or a Python write/truncate/null copy. Appends
+    and ordinary in-place substitutions do not.
+    """
+    if step.family_name == "file_write":
+        return any(_is_live_config(value, cwd) for value in _path_candidates(step))
+    if step.family_name not in SHELL_TOOLS:
+        return False
+    if any(_is_live_config(target, cwd) for target in shell_python_overwrites(step)):
+        return True
+    return _shell_config_overwrite(step, cwd)
+
+
 def _within(path: str, directory: str) -> bool:
     return path.startswith(directory.rstrip("/") + "/")
 
@@ -749,12 +1099,20 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
         reported_cwd = next(
             (value for field, value in step.fields if field == "cwd"), ""
         )
-        cwd = _literal_path(reported_cwd) if reported_cwd else prior_cwd
+        # A non-literal cwd (`~`, `$HOME`) cannot be resolved. Keep the last
+        # absolute directory instead of forgetting it.
+        if reported_cwd:
+            literal_cwd = _literal_path(reported_cwd)
+            if literal_cwd.startswith("/"):
+                cwd = literal_cwd
+                prior_cwd = cwd
+            else:
+                cwd = prior_cwd
+        else:
+            cwd = prior_cwd
         if not cwd.startswith("/"):
             cwd = ""
-        if reported_cwd:
-            prior_cwd = cwd
-        destructive = is_destructive(step)
+        destructive = is_destructive(step) or _config_overwrite(step, cwd)
         transfers = tuple(shell_transfers(step))
         dedicated_send = step.family_name in SEND_TOOLS
         if sensitive_seen and (
@@ -776,9 +1134,9 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
             if step.family_name in READ_TOOLS:
                 sensitive_paths.update(
                     path
-                    for value in _field_paths(step)
-                    if _sensitive_marker(value, cwd)
-                    and (path := _literal_path(value, cwd))
+                    for value in _path_candidates(step)
+                    if _path_is_sensitive(value, cwd, step.result)
+                    and (path := _stored_sensitive_path(value, cwd))
                 )
         if not destructive:
             _inspection_paths(step, cwd, listed, read)

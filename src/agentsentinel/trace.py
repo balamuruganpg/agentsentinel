@@ -51,6 +51,9 @@ class Step:
     arguments: tuple[str, ...]
     fields: tuple[tuple[str, str], ...] = ()
     result_fields: tuple[tuple[str, str], ...] = ()
+    # Read results corroborate path evidence. They are not argument text, so a
+    # secret mentioned in a file body cannot become a path match by itself.
+    result: str = ""
 
     @property
     def text(self) -> str:
@@ -107,8 +110,10 @@ def normalize_trace(trace: dict[str, object]) -> tuple[Step, ...]:
         arguments, fields = _strings(args)
         tool = tool.strip().lower()
         tool = _CANONICAL_TOOL_NAMES.get(tool, tool)
+        raw_result = step.get("result")
+        result_text = raw_result if isinstance(raw_result, str) else ""
         result_fields: tuple[tuple[str, str], ...] = ()
         if _family_name(tool) == "db_query":
-            _, result_fields = _strings(step.get("result"))
-        normalized.append(Step(tool, arguments, fields, result_fields))
+            _, result_fields = _strings(raw_result)
+        normalized.append(Step(tool, arguments, fields, result_fields, result_text))
     return tuple(normalized)

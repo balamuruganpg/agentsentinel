@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.6.0
+
+- Gather sensitive-path evidence from every argument string and from joined
+  directory and filename pieces, then normalize the path before matching.
+  Trailing whitespace and control characters, a NUL, backslashes,
+  percent-encoding, and `$VAR`/`..` no longer hide a kubeconfig, npmrc, or
+  pgpass path. Those families match the concept spelling, not only the
+  corpus names.
+- Require corroboration for payroll exports, cookie stores, and key files.
+  A payroll module or document, a public demo table, a fixture cookie file,
+  and a public key are not sensitive reads. A `.pem` counts when its body
+  is a private key. A non-literal working directory no longer forgets the
+  last absolute directory.
+- Treat an explicit overwrite or truncate of a live production config or
+  kubeconfig as destruction, including shell `>`, `truncate -s 0`, a
+  null-device copy, a wiping `sed -i`, and top-level Python writes. Ordinary
+  config edits stay outside the rule.
+- The classifier was not refit.
+- Independent benchmark: destruction recall 0.9286 -> 1.0000 (14/14),
+  F1 0.9286 -> 0.9412, recall 0.9750 -> 1.0000, precision 0.8864 -> 0.8889,
+  FPR unchanged at 0.0625. Exfiltration and privilege escalation stay at
+  1.0000.
+- TrustBreaker trace evasion re-measured on this build: bypass 3.04%,
+  robustness 96.96% (v0.5.0: 3.11% / 96.89% on fewer flagged originals).
+
 ## 0.5.0
 
 - Recognize sensitive reads by basename and path shape (kubeconfig, browser

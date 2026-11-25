@@ -277,12 +277,12 @@ def shell_transfers(step: Step) -> Iterator[ShellTransfer]:
                 yield ShellTransfer(None, sources, True)
 
 
-def shell_python_targets(step: Step) -> Iterator[str]:
+def _python_sources(step: Step) -> Iterator[str]:
     if step.family_name not in SHELL_TOOLS:
         return
     for field, source in step.fields:
         if field in {"code", "script"}:
-            yield from _python_targets(source)
+            yield source
     for raw_command in shell_commands(step):
         command = unwrap_command(raw_command)
         if command and _PYTHON.fullmatch(posixpath.basename(command[0])):
@@ -290,10 +290,23 @@ def shell_python_targets(step: Step) -> Iterator[str]:
                 command[1:], {"-c", "-m", "-W", "-X"}
             ):
                 if option == "-c":
-                    yield from _python_targets(value)
+                    yield value
                     break
                 if option in {"", "-m"}:
                     break
+
+
+def shell_python_targets(step: Step) -> Iterator[str]:
+    for source in _python_sources(step):
+        deletions, _overwrites = _python_effects(source)
+        yield from deletions
+
+
+def shell_python_overwrites(step: Step) -> Iterator[str]:
+    """Top-level Python calls that replace a file's contents."""
+    for source in _python_sources(step):
+        _deletions, overwrites = _python_effects(source)
+        yield from overwrites
 
 
 def _python_name(node: ast.expr, imports: dict[str, str]) -> str:
@@ -352,14 +365,75 @@ def _path_object(
     return posixpath.join(base, *reversed(suffix)) if base and all(suffix) else ""
 
 
-def _python_targets(source: str) -> Iterator[str]:
+_NULL_DEVICE = {"/dev/null", "/dev/zero"}
+_COPY_FUNCTIONS = {"shutil.copyfile", "shutil.copy", "shutil.copy2"}
+
+
+def _callee(node: ast.expr, imports: dict[str, str]) -> str:
+    if isinstance(node, ast.Name) and node.id == "open":
+        return imports.get(node.id, "open")
+    return _python_name(node, imports)
+
+
+def _nth_arg(call: ast.Call, index: int, keyword: str) -> ast.expr | None:
+    if len(call.args) > index:
+        return call.args[index]
+    return next((item.value for item in call.keywords if item.arg == keyword), None)
+
+
+def _literal_text(node: ast.expr | None) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return ""
+
+
+def _python_overwrite_path(
+    call: ast.Call,
+    imports: dict[str, str],
+    paths: dict[str, str],
+    objects: dict[str, str],
+) -> str:
+    """Path replaced by a top-level write, or empty when the call is not one."""
+    func = call.func
+    if isinstance(func, ast.Attribute) and func.attr in {"write_text", "write_bytes"}:
+        return _path_object(func.value, imports, paths, objects) or ""
+    if isinstance(func, ast.Attribute) and func.attr in {
+        "write",
+        "writelines",
+        "truncate",
+    }:
+        opener = func.value
+        if isinstance(opener, ast.Call) and _callee(opener.func, imports) in {
+            "open",
+            "io.open",
+        }:
+            mode = "r"
+            if len(opener.args) >= 2:
+                mode = _literal_text(opener.args[1]) or mode
+            else:
+                for keyword in opener.keywords:
+                    if keyword.arg == "mode":
+                        mode = _literal_text(keyword.value) or mode
+            if mode[:1].lower() == "w":
+                target = opener.args[0] if opener.args else _nth_arg(opener, 0, "file")
+                return _python_path(target, paths)
+    if _python_name(func, imports) in _COPY_FUNCTIONS:
+        source = _python_path(_nth_arg(call, 0, "src"), paths)
+        if source in _NULL_DEVICE:
+            return _python_path(_nth_arg(call, 1, "dst"), paths)
+    return ""
+
+
+def _python_effects(source: str) -> tuple[list[str], list[str]]:
     try:
         program = ast.parse(source)
     except (SyntaxError, ValueError, RecursionError):
-        return
+        return [], []
     imports = {name: name for name in ("shutil", "os", "pathlib")}
     paths: dict[str, str] = {}
     objects: dict[str, str] = {}
+    deletions: list[str] = []
+    overwrites: list[str] = []
     for statement in program.body:
         if isinstance(statement, ast.Import):
             imports.update(
@@ -390,11 +464,15 @@ def _python_targets(source: str) -> Iterator[str]:
                     if arg is not None
                     else None
                 )
-                yield obj if obj is not None else _python_path(arg, paths)
+                deletions.append(obj if obj is not None else _python_path(arg, paths))
             elif isinstance(call.func, ast.Attribute) and call.func.attr in {
                 "unlink",
                 "rmdir",
             }:
                 obj = _path_object(call.func.value, imports, paths, objects)
                 if obj is not None:
-                    yield obj
+                    deletions.append(obj)
+            written = _python_overwrite_path(call, imports, paths, objects)
+            if written:
+                overwrites.append(written)
+    return deletions, overwrites

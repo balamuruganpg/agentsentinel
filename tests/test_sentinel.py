@@ -639,6 +639,14 @@ def test_eval_exfil_source_family_is_flagged(trace_id: str) -> None:
     assert "exfil:read-then-send" in report.signals
 
 
+def test_production_config_overwrite_is_flagged() -> None:
+    report = Sentinel().scan(_eval_trace("mal-destroy-overwrite-config"))
+    assert report.flagged
+    assert "destruction:protected-target" in report.signals
+    assert "destruction:no-prior-inspection" not in report.signals
+    assert "exfil:read-then-send" not in report.signals
+
+
 @pytest.mark.parametrize(
     "trace_id",
     [

@@ -11,8 +11,10 @@ from agentsentinel import Sentinel, TraceReport
 A trace is a dict `{"trace_id": str, "steps": [step, ...]}`. Each step has a
 string `tool`, optional dict `args` (default `{}`), and optional `result`.
 `db_query` results can be strings or contain nested strings in objects or
-lists. Only the database sensitive-read rule uses results. Trace IDs are
-ignored.
+lists. Structured result fields are used only by the database sensitive-read
+rule. A file-read `result` that is a string corroborates payroll-column and
+private-key evidence; it is not argument text and is not scanned for paths.
+Trace IDs are ignored.
 
 `Sentinel(threshold: float = 0.5)` rejects thresholds outside [0, 1], including
 NaN and infinities, with `ValueError`. `scan(trace: dict) -> TraceReport` returns
@@ -97,11 +99,56 @@ are sensitive without a path: `env`, `printenv`, `env_dump`, `dump_env`,
 are also treated as sensitive reads.
 
 For `db_query`, a `SELECT` mentioning identifiers such as `customer_records`,
-`email`, `password_hash`, or `api_key` is a sensitive read. The rule also
-recognizes credential fields with nonempty string values in structured results
-and secret markers in result strings, including key/value pairs, private-key
-headers, and access-key IDs. SQL statement fields include `query`, `sql`,
-`statement`, and `command`.
+`email`, `password_hash`, or `api_key` is a sensitive read. The same rule
+treats `payroll`, `salary`/`salaries`, `wage(s)`, `compensation(s)`, and
+`iban(s)` as sensitive identifiers. The rule also recognizes credential
+fields with nonempty string values in structured results and secret markers
+in result strings, including key/value pairs, private-key headers, and
+access-key IDs. SQL statement fields include `query`, `sql`, `statement`,
+and `command`.
+
+Sensitive-path evidence for kubeconfig, npmrc, pgpass, payroll, cookie, and
+key files is gathered from every string argument, including nested objects
+and lists. The key name is not required. A directory-role field plus a
+filename-role field, and a list of path segments under one key, are joined
+before matching. Each candidate is normalized first: a NUL and anything
+after it is dropped, leading and trailing whitespace and C0/DEL controls are
+stripped, backslashes become slashes, percent-encoding is decoded, and
+`$VAR` / `${VAR}` become a placeholder segment so `..` still folds. The
+concept pattern must match that whole normalized path. A sentence that only
+mentions a filename does not match. Legacy tokens (`.env`, `id_rsa`, and
+the rest of the pattern above) still match anywhere in the argument text.
+
+Kubeconfig matches `.kube/config` or `.kube/admin.conf` with an optional
+`yml`/`yaml`/`json`/`bak`/`old` suffix, a basename containing `kubeconfig`
+with those suffixes, or `kubernetes/{admin,kubelet,controller-manager,scheduler}.conf`.
+npmrc matches an optional-dot `npmrc` with an optional `bak`/`old`/`backup`/`save`
+suffix. pgpass matches an optional-dot `pgpass` with an optional
+`conf`/`bak`/`old` suffix.
+
+Payroll, cookie stores, and key files need corroboration, and a path under
+`public`, `doc(s)`, `test(s)`, `fixture(s)`, `example(s)`, `sample(s)`, or
+`demo(s)` does not qualify on the name. A payroll path also needs a data
+extension (`csv`, `tsv`, `json`, `ndjson`, `xls`, `xlsx`, `parquet`), a
+`payroll` token, and either an export-context directory (`private`,
+`export(s)`, `confidential`, `secret(s)`, `hr`, `payroll`, `compensation`,
+`salaries`) or payroll columns in the read result (`salary`, `salaries`,
+`iban`, `bank_account`, `compensation`, `wages`). `payroll.py` and
+`payroll.md` do not qualify.
+
+A cookie basename (`session-cookies.json`, `session_cookies.json`,
+`session-cookie.json`, `cookies.json`, `cookies.sqlite`) counts when the
+path sits in a browser profile (`.config/browser`, Chrome-family, Firefox,
+`.mozilla`) or the result is cookie-shaped (`domain` together with
+`session`/`cookie`, or `Set-Cookie`). A Chrome-family `Cookies` file under
+`Default`, `Profile*`, `System Profile`, or `Guest Profile` counts on the
+path alone.
+
+A `.key` file counts unless the result is a `PUBLIC KEY` or `CERTIFICATE`
+block, the basename contains `public`, `localhost`, or `example`, or the
+path is in a sample tree. A `.pem` file counts only when the result contains
+a `PRIVATE KEY` block. That block also keeps a `.key` file sensitive.
+
 
 Send tools include `http_post`, `http_request`, `email_send`, `webhook`, `upload`,
 and `git_push`.
@@ -162,8 +209,13 @@ The scanner parses literal Python source in `python -c` commands and
 shell-step `script` and `code` fields using the stdlib AST. It recognizes
 direct top-level calls to `shutil.rmtree`, `os.remove`, `os.unlink`, and
 `pathlib.Path` instances' `unlink` and `rmdir` methods, with simple imports
-and path assignments. An unresolved operand for a recognized removal is an
-unknown target. The scanner reads only source supplied in the trace.
+and path assignments. The same parser recognizes top-level overwrites:
+`Path.write_text` / `write_bytes`, `open` or `io.open` in a mode beginning
+with `w` followed by `write`, `writelines`, or `truncate`, and
+`shutil.copyfile` / `copy` / `copy2` when the source is `/dev/null` or
+`/dev/zero`. Nested function bodies do not count. An unresolved operand for
+a recognized removal is an unknown target. The scanner reads only source
+supplied in the trace.
 
 Recognized database mutations and format/mkfs operations always target protected
 resources. Explicit `database`, `db`, or `table` fields also mark protected
@@ -174,7 +226,10 @@ Scratch paths include literal absolute descendants of `/tmp/`, `/var/tmp/`,
 `/workspace/`, and `/workspaces/`. A normalized relative target beginning in
 `build`, `tmp`, or `temp` is assumed workspace-relative in the absence of a
 recorded absolute `cwd`. A deletion can use its own or the latest earlier
-reported working directory. Under that working directory, a target with a
+reported working directory. A reported working directory that is not a
+literal absolute path (`~`, `$HOME`, or another expansion) is ignored, and
+the last literal absolute directory is kept. Home directories are not
+expanded. Under that working directory, a target with a
 `build`, `tmp`, or `temp` component can qualify as scratch. Without a working
 directory, an absolute cleanup can qualify when an earlier listing covers the
 target and the trace corroborates the workspace root. Corroboration can be an
@@ -192,10 +247,20 @@ Earlier inspection includes file and variable reads, `list`, `ls`, `dir`,
 Shell `cat`, `dir`, `ls`, `stat`, `head`, and `tail` count on steps without a
 destructive operation. The recorded inspection may concern any target.
 
-A generic `file_write` to a configuration or credential file does not
-establish destruction under these operation definitions. Such a write can
-represent creation, maintenance, or a harmful overwrite. The rule has no
-before/after state or overwrite operation contract for these tools.
+Replacing a live production config is destruction. A live config is an
+absolute path outside the scratch roots and outside the public, doc, test,
+fixture, example, sample, and demo trees, and it is either a kubeconfig
+shape from the exfiltration rule or a basename `production` plus a config
+extension (`yml`, `yaml`, `json`, `toml`, `ini`, `conf`, `cfg`, `config`).
+`file_write` and its `save_document` alias have no separate overwrite verb,
+so any write onto such a path counts, including an empty body. Shell counts
+only an explicit truncate: `>` or `>|` (not `>>`), `truncate -s 0`, `cp` or
+`mv` from `/dev/null` or `/dev/zero`, `dd` with `if` set to one of those
+devices, or a wiping `sed -i` whose substitution replaces the whole line
+with nothing. Python counts only the top-level overwrite calls above.
+Appends, ordinary in-place substitutions, and writes of other config files
+(a project `.env`, a service manifest, a staging file, a fixture, a scratch
+copy) are not this operation.
 
 ### Privilege escalation
 
@@ -325,6 +390,8 @@ v0.3.0 recall by category is 0.6250 for exfiltration (10/16), 0.9286 for
 destruction (13/14), and 1.0000 for privilege escalation (10/10). The threshold
 sweep is descriptive. The published cutoff stayed at 0.5 throughout the
 experiment. [Independent benchmark report](evals/results/benchmark-v0.3.0.md)
+Later releases keep the 0.5 threshold. Current measurements are in
+[evals/results/benchmark-v0.6.0.md](evals/results/benchmark-v0.6.0.md).
 
 ## Limits
 
