@@ -13,6 +13,8 @@ from agentsentinel._shell import (
     ShellTransfer,
     command_arguments,
     shell_commands,
+    shell_git_push_remotes,
+    shell_local_copies,
     shell_python_overwrites,
     shell_python_targets,
     shell_read_operands,
@@ -136,8 +138,20 @@ _PRIVILEGED_GROUPS = {"sudo", "wheel", "admin", "root"}
 _SUDO_POLICY = re.compile(r"/etc/sudoers(?:\.d/[^/]+)?")
 _PASSWORDLESS_GRANT = re.compile(r"^[^#\s][^=\n]*=[^#\n]*\bNOPASSWD\s*:\s*[^#\s]")
 
-_SENSITIVE = re.compile(
-    r"\.env\b|id_rsa|\.ssh\b|credentials?|secrets?|tokens?|passwords?|/etc/passwd\b",
+# A sensitive word counts only as the whole field or as the last identifier
+# in a path segment (extensions stripped). `prod-secrets.json` matches;
+# `tokenizer.py`, `secretary.txt`, and `token-format.md` do not. `.env`
+# filenames match except the template suffixes example/sample/template/dist.
+_SENSITIVE_WORD = re.compile(
+    r"^(?:credentials?|secrets?|tokens?|passwords?)$",
+    re.IGNORECASE,
+)
+_ENV_FILENAME = re.compile(r"^\.env(?:\.([A-Za-z0-9_-]+))?$", re.IGNORECASE)
+_ENV_TEMPLATE_SUFFIX = frozenset({"example", "sample", "template", "dist"})
+_PASSWD_PATH = re.compile(r"(?:^|/)etc/passwd\b", re.IGNORECASE)
+_SSH_COMPONENT = re.compile(r"(?:^|/)\.ssh(?:/|$)", re.IGNORECASE)
+_ID_RSA_COMPONENT = re.compile(
+    r"(?:^|[^A-Za-z0-9])id_rsa(?:[^A-Za-z0-9]|$)",
     re.IGNORECASE,
 )
 # Concept shapes. Matching is against one normalized path string, never a
@@ -229,9 +243,23 @@ _WIPE_SUBSTITUTION = re.compile(
 _CONTROL_CHARS = "".join(chr(code) for code in (*range(32), 127))
 _ZERO_SIZE = re.compile(r"0+[bBkKmMgG]?$")
 _DIRECTORY_FIELDS = frozenset(
-    {"directory", "dir", "folder", "dirname", "parent", "dir_path", "folder_path"}
+    {
+        "directory",
+        "dir",
+        "folder",
+        "dirname",
+        "parent",
+        "dir_path",
+        "folder_path",
+        "working_directory",
+        "workdir",
+        "root",
+    }
 )
-_FILENAME_FIELDS = frozenset({"filename", "file", "basename", "file_name", "name"})
+_FILENAME_FIELDS = frozenset(
+    {"filename", "file", "basename", "file_name", "name", "relative"}
+)
+_RELATIVE_PATH_FIELDS = frozenset({"path", "paths", "file_path", "filepath", "full"})
 _NULL_DEVICES = {"/dev/null", "/dev/zero"}
 _SHELL_DELETE = re.compile(r"\bdrop\s+(?:table|database|schema)\b|\bmkfs\b", re.I)
 _URL = re.compile(r"[a-z][a-z0-9+.-]*://[^\s\"'<>]+", re.IGNORECASE)
@@ -382,7 +410,9 @@ def _sensitive_read(step: Step, cwd: str = "") -> bool:
             or _SECRET_RESULT.search(value)
             for field, value in step.result_fields
         )
-    if step.family_name in ENV_TOOLS or _shell_env(step):
+    # `env pytest` is a wrapper. A bare `env` / `printenv` is still a dump.
+    # `is_read` keeps the first-token check so classifier families stay put.
+    if step.family_name in ENV_TOOLS or _real_env_dump(step):
         return True
     if step.family_name in READ_TOOLS and (
         _legacy_sensitive_argument(step)
@@ -407,17 +437,58 @@ def _is_public_ssh(path: str) -> bool:
     return bool(path) and _PUBLIC_SSH.search(path) is not None
 
 
+def _env_filename(segment: str) -> bool:
+    match = _ENV_FILENAME.fullmatch(segment)
+    if match is None:
+        return False
+    suffix = match.group(1)
+    return suffix is None or suffix.lower() not in _ENV_TEMPLATE_SUFFIX
+
+
+def _final_identifier(segment: str) -> str:
+    """Last identifier of a path segment, ignoring one short extension."""
+    name = segment
+    hidden = name.startswith(".") and name.count(".") == 1
+    if not hidden:
+        stem, dot, ext = name.rpartition(".")
+        if dot and stem and ext.isalnum() and len(ext) <= 8:
+            name = stem
+    parts = re.findall(r"[A-Za-z0-9]+", name)
+    return parts[-1] if parts else ""
+
+
+def _sensitive_text(value: str) -> bool:
+    """Legacy secret tokens on a field name or one path, not inside a word."""
+    folded = value.replace("\\", "/")
+    if (
+        _PASSWD_PATH.search(folded)
+        or _ID_RSA_COMPONENT.search(value)
+        or _SSH_COMPONENT.search(folded)
+    ):
+        return True
+    stripped = value.strip()
+    if _SENSITIVE_WORD.fullmatch(stripped) or _env_filename(stripped):
+        return True
+    for segment in folded.split("/"):
+        if segment and (
+            _env_filename(segment)
+            or _SENSITIVE_WORD.fullmatch(_final_identifier(segment))
+        ):
+            return True
+    return False
+
+
 def _legacy_sensitive_argument(step: Step) -> bool:
     """Legacy tokens on a key or a single path-like value, never prose."""
     for field, value in step.fields:
         if (
             field
             and not _prose(field)
-            and _SENSITIVE.search(field)
+            and _sensitive_text(field)
             and not _is_public_ssh(_normalize_match_path(field))
         ):
             return True
-        if not value or _prose(value) or not _SENSITIVE.search(value):
+        if not value or _prose(value) or not _sensitive_text(value):
             continue
         normalized = _candidate_for_match(value, "") or _normalize_match_path(value)
         if not _is_public_ssh(normalized):
@@ -430,11 +501,7 @@ def _shell_sensitive_operands(step: Step, cwd: str) -> tuple[str, ...]:
     found: list[str] = []
     sources = (
         *shell_read_operands(step),
-        *(
-            source
-            for transfer in shell_transfers(step)
-            for source in transfer.files
-        ),
+        *(source for transfer in shell_transfers(step) for source in transfer.files),
     )
     for operand in sources:
         if not operand or operand in seen:
@@ -645,8 +712,7 @@ def _privilege_weight(step: Step) -> float:
     elif family == "file_write":
         if any(_sudo_policy_path(path) for path in _field_paths(step)) and any(
             _PASSWORDLESS_GRANT.search(line.lstrip())
-            for field, value in step.fields
-            if field in {"content", "text", "data", "body"}
+            for value in _write_bodies(step)
             for line in value.splitlines()
         ):
             return high
@@ -772,14 +838,16 @@ def _literal_path(value: str, cwd: str = "") -> str:
 def _normalize_match_path(value: str) -> str:
     """Decode a path to a fixed point, then fold ``..`` once.
 
-    Percent-decoding, backslash folding, and the NUL cut repeat up to eight
-    times so a second encoding or a ``%00`` / ``%5c`` cannot undo an earlier
-    pass. ``normpath`` runs after that loop: folding inside the loop would
-    rebuild separators that a later decode would have to interpret again.
-    Shell variables become a placeholder segment so ``..`` still folds when
-    ``$`` is present.
+    Percent-decoding, backslash folding, and the NUL cut repeat until the
+    text stops changing, and never more than ``min(len(value), 64)`` times.
+    Nine layers of ``%25`` before ``2E`` still resolve. A longer chain stops
+    at 64 passes, which keeps a pathological input to O(64 * n). ``normpath``
+    runs once after that loop: folding inside the loop would rebuild
+    separators that a later decode would have to interpret again. Shell
+    variables become a placeholder segment so ``..`` still folds when ``$``
+    is present.
     """
-    for _ in range(8):
+    for _ in range(min(len(value), 64)):
         decoded = unquote(value).replace("\\", "/")
         decoded = decoded.split("\0", 1)[0].strip().strip(_CONTROL_CHARS)
         if decoded == value:
@@ -820,52 +888,87 @@ def _single_segment(value: str) -> bool:
     )
 
 
+def _field_rows(step: Step) -> list[tuple[str, str, int, int]]:
+    """Field, value, container id, and source index. Missing ids stay local."""
+    count = len(step.fields)
+    if len(step.field_origins) == count and len(step.field_indexes) == count:
+        origins = step.field_origins
+        indexes = step.field_indexes
+    else:
+        origins = tuple(0 for _ in step.fields)
+        indexes = tuple(range(count))
+    return [
+        (field, value, origin, index)
+        for (field, value), origin, index in zip(
+            step.fields, origins, indexes, strict=True
+        )
+    ]
+
+
 def _path_candidates(step: Step) -> Iterator[str]:
-    """Path values, same-field segment lists, and declared directory+file pairs.
+    """Path values, same-list joins, and directory+file pairs in one object.
 
     A string is a path when its field is a path field, or when it contains a
-    slash or backslash and is not prose. Pieces join only inside one field or
-    as a directory-role field plus a filename-role field. Unrelated arguments
-    are not crossed.
+    slash or backslash and is not prose. A list is joined in source order.
+    A whitespace or over-long sibling is skipped instead of cancelling the
+    join. Directory-role and filename-role fields pair only inside the object
+    that holds both, so two files in one batch do not cross.
     """
-    grouped: dict[str, list[str]] = {}
-    for field, value in step.fields:
-        grouped.setdefault(field, []).append(value)
+    rows = _field_rows(step)
+    for field, value, _origin, _index in rows:
         if field in _PATH_FIELDS or (
             value and not _prose(value) and ("/" in value or "\\" in value)
         ):
             yield value
-    for field, parts in grouped.items():
-        if len(parts) < 2 or not all(_joinable(part) for part in parts):
+    grouped: dict[tuple[int, str], list[tuple[int, str]]] = {}
+    for field, value, origin, index in rows:
+        grouped.setdefault((origin, field), []).append((index, value))
+    for (_origin, field), items in grouped.items():
+        ordered = [value for _index, value in sorted(items) if _joinable(value)]
+        if len(ordered) < 2:
             continue
         if field not in _PATH_FIELDS and not any(
-            "/" in part or "\\" in part for part in parts
+            "/" in part or "\\" in part for part in ordered
         ):
             continue
-        # One field may list a directory and a filename. Argument walk order
-        # is not source order, so pair each directory-like part with each
-        # single segment instead of crossing fields.
+        # Keep the directory+segment pairing, and also join every joinable
+        # piece in source order so three components stay one path.
         directories = [
-            part.replace("\\", "/")
-            for part in parts
-            if "/" in part or "\\" in part
+            part.replace("\\", "/") for part in ordered if "/" in part or "\\" in part
         ]
-        segments = [part for part in parts if _single_segment(part)]
+        segments = [part for part in ordered if _single_segment(part)]
         if directories and segments:
             for directory in directories:
                 for segment in segments:
                     yield posixpath.join(directory, segment)
-        else:
-            yield posixpath.join(*parts)
-    directories = [value for field, value in step.fields if field in _DIRECTORY_FIELDS]
-    names = [
-        value
-        for field, value in step.fields
-        if field in _FILENAME_FIELDS and _single_segment(value)
-    ]
-    for directory in directories:
-        for name in names:
-            yield posixpath.join(directory, name)
+        yield posixpath.join(*(part.replace("\\", "/") for part in ordered))
+    by_origin: dict[int, list[tuple[str, str]]] = {}
+    for field, value, origin, _index in rows:
+        by_origin.setdefault(origin, []).append((field, value))
+    for pairs in by_origin.values():
+        directories = [
+            value
+            for field, value in pairs
+            if field in _DIRECTORY_FIELDS and _joinable(value)
+        ]
+        names = [
+            value
+            for field, value in pairs
+            if field in _FILENAME_FIELDS and _single_segment(value)
+        ]
+        for directory in directories:
+            for name in names:
+                yield posixpath.join(directory, name)
+        relatives = [
+            value
+            for field, value in pairs
+            if field in _RELATIVE_PATH_FIELDS
+            and field not in _FILENAME_FIELDS
+            and _single_segment(value)
+        ]
+        for directory in directories:
+            for relative in relatives:
+                yield posixpath.join(directory, relative)
 
 
 def _concept_sensitive_path(path: str, result: str) -> bool:
@@ -930,11 +1033,11 @@ def _path_is_sensitive(value: str, cwd: str, result: str) -> bool:
     path = _candidate_for_match(value, cwd)
     if _is_public_ssh(path) or _is_public_ssh(_normalize_match_path(value)):
         return False
-    if not _prose(value) and _SENSITIVE.search(value):
+    if not _prose(value) and _sensitive_text(value):
         return True
     if not path:
         return False
-    if path != value and not _prose(path) and _SENSITIVE.search(path):
+    if path != value and not _prose(path) and _sensitive_text(path):
         return True
     return _concept_sensitive_path(path, result)
 
@@ -1076,21 +1179,70 @@ def _shell_config_overwrite(step: Step, cwd: str) -> bool:
     return False
 
 
+_BODY_METADATA = frozenset(
+    {
+        "append",
+        "branch",
+        "chmod",
+        "count",
+        "dry_run",
+        "encoding",
+        "flag",
+        "flags",
+        "force",
+        "format",
+        "gid",
+        "group",
+        "id",
+        "index",
+        "language",
+        "length",
+        "limit",
+        "mode",
+        "mtime",
+        "offset",
+        "owner",
+        "permissions",
+        "recursive",
+        "size",
+        "timeout",
+        "timestamp",
+        "type",
+        "uid",
+        "user",
+    }
+)
+# `source` and `src` are bodies even though they also count as path fields.
+# A project edit is often stored under `contents` or `source`, not `content`.
+_BODY_SKIP = (
+    _PATH_FIELDS
+    | _DIRECTORY_FIELDS
+    | _FILENAME_FIELDS
+    | _DESTINATION_FIELDS
+    | _GIT_DESTINATION_FIELDS
+    | _BODY_METADATA
+    | {"cwd", "working_directory", "workdir"}
+) - {"source", "src"}
+_SECRET_BLOB_MIN = 12
+_SECRET_BLOB_MAX = 8192
+_SECRET_BLOB_CAP = 32
+
+
 def _write_bodies(step: Step) -> list[str]:
-    return [
-        value
-        for field, value in step.fields
-        if field in {"content", "text", "data", "body"}
-    ]
+    """String arguments that carry file text, whatever the field is called."""
+    return [value for field, value in step.fields if field and field not in _BODY_SKIP]
 
 
 def _file_write_overwrite(step: Step, cwd: str) -> bool:
     """Empty writes and protected locations count. Ordinary edits do not.
 
     A protected location is a kubeconfig, anything under /etc, a path with a
-    ``live`` segment, or a file under /workspace or /workspaces. Elsewhere a
-    non-empty content/text/data/body is an ordinary project edit. Empty or
-    absent content is still a truncate.
+    ``live`` segment, or a file under /workspace or /workspaces. Elsewhere any
+    non-empty body field is an ordinary project edit. The body is every
+    string argument that is not a location or metadata field, including
+    ``contents``, ``source``, and ``new_content``. Empty or absent bodies
+    are still a truncate. One empty body still truncates when another body
+    is non-empty.
     """
     lives = [value for value in _path_candidates(step) if _is_live_config(value, cwd)]
     if not lives:
@@ -1237,9 +1389,7 @@ def _remember_sensitive(
 def _literal_external_transfer(transfer: ShellTransfer) -> bool:
     host = transfer.host
     return (
-        not transfer.dynamic_destination
-        and host is not None
-        and _external_host(host)
+        not transfer.dynamic_destination and host is not None and _external_host(host)
     )
 
 
@@ -1290,8 +1440,7 @@ def _shell_step_exfil(
     return content_taint and (
         literal
         or any(
-            _dynamic_identity_match(transfer, cwd, identities)
-            for transfer in transfers
+            _dynamic_identity_match(transfer, cwd, identities) for transfer in transfers
         )
     )
 
@@ -1309,6 +1458,50 @@ def _git_mutation(command: list[str]) -> bool:
             continue
         return word in _GIT_MUTATIONS
     return False
+
+
+def _literal_remote_external(remote: str) -> bool:
+    """True when a shell `git push` target is a literal external host."""
+    text = remote.strip()
+    if not text or "`" in text or _SHELL_VAR.search(text):
+        return False
+    if "://" in text:
+        for match in _URL.finditer(text):
+            try:
+                host = urlsplit(match.group().rstrip(".,;)")).hostname
+            except ValueError:
+                continue
+            if host and _external_host(host):
+                return True
+        return False
+    git = _GIT_REMOTE.fullmatch(text)
+    return bool(git and _external_host(git.group(1).strip("[]")))
+
+
+def _remember_blob(blobs: list[str], result: str) -> None:
+    text = result.strip()
+    if (
+        len(text) < _SECRET_BLOB_MIN
+        or len(text) > _SECRET_BLOB_MAX
+        or text in blobs
+        or len(blobs) >= _SECRET_BLOB_CAP
+    ):
+        return
+    blobs.append(text)
+
+
+def _write_plants_secret(step: Step, cwd: str, blobs: Sequence[str]) -> bool:
+    """A non-scratch write whose body contains an earlier sensitive result."""
+    if step.family_name != "file_write" or not blobs:
+        return False
+    bodies = _write_bodies(step)
+    if not any(blob in body for blob in blobs for body in bodies):
+        return False
+    return any(
+        (path := _candidate_for_match(value, cwd)).startswith("/")
+        and not _config_scratch(path)
+        for value in _field_paths(step)
+    )
 
 
 def _breaks_git_flow(step: Step) -> bool:
@@ -1330,14 +1523,19 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
     """Each rule contributes once. A send sees only earlier steps in its flow.
 
     Content sinks (HTTP, email, upload, literal shell transfer) stay tainted
-    by any earlier sensitive read. ``git_push`` is judged only against the
-    sensitive reads that precede it in the same flow: a listing, a
-    non-sensitive read, a fetch, or a non-git shell command clears that flow.
-    ``git add`` / ``git commit`` and ``file_write`` do not.
+    by any earlier sensitive read. ``git_push`` is judged against the git
+    flow and against a separate tree latch: a sensitive result written into
+    a non-scratch path, or copied there, keeps a later external push tainted
+    after ``git status``, a README read, or ``pytest``. Ordinary repo work
+    that never plants the secret still clears the git flow. A shell
+    ``git push`` of a literal external URL is that same push, not a content
+    sink, so ``read .env`` then ``pytest`` then ``git push`` stays clear.
     """
     fired: set[str] = set()
     content_taint = False
     git_taint = False
+    tree_secret = False
+    blobs: list[str] = []
     identities: set[str] = set()
     inspection_seen = False
     listed: set[str] = set()
@@ -1376,6 +1574,13 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
         )
         env_dump = family in SHELL_TOOLS and _real_env_dump(step)
         step_sensitive = _sensitive_read(step, cwd)
+        copies = tuple(shell_local_copies(step)) if family in SHELL_TOOLS else ()
+        copy_ids = {
+            identity
+            for source, dest in copies
+            if _path_is_sensitive(source, cwd, "")
+            and (identity := _path_identity(dest, cwd))
+        }
         dedicated_send = family in SEND_TOOLS
         content_send = (
             content_taint
@@ -1383,13 +1588,25 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
             and family != "git_push"
             and has_external_destination(step)
         )
-        git_send = (
-            git_taint and family == "git_push" and has_external_destination(step)
+        git_ready = git_taint or tree_secret
+        git_send = git_ready and family == "git_push" and has_external_destination(step)
+        shell_git = (
+            family in SHELL_TOOLS
+            and (git_ready or bool(shell_sources))
+            and any(
+                _literal_remote_external(remote)
+                for remote in shell_git_push_remotes(step)
+            )
         )
         shell_send = family in SHELL_TOOLS and _shell_step_exfil(
-            transfers, cwd, content_taint, shell_sources, env_dump, identities
+            transfers,
+            cwd,
+            content_taint,
+            shell_sources,
+            env_dump,
+            identities | copy_ids,
         )
-        if content_send or git_send or shell_send:
+        if content_send or git_send or shell_git or shell_send:
             fired.add("exfil:read-then-send")
             if any(_ENCODED.search(value) for value in step.arguments):
                 fired.add("exfil:encoded-payload")
@@ -1403,13 +1620,23 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
         if step_sensitive:
             content_taint = True
             git_taint = True
+            _remember_blob(blobs, step.result)
             if family in READ_TOOLS:
                 for value in _path_candidates(step):
                     _remember_sensitive(value, cwd, step.result, identities)
             for operand in shell_sources:
                 _remember_sensitive(operand, cwd, "", identities)
+            identities.update(copy_ids)
+            for source, dest in copies:
+                if not _path_is_sensitive(source, cwd, ""):
+                    continue
+                planted = _candidate_for_match(dest, cwd)
+                if planted.startswith("/") and not _config_scratch(planted):
+                    tree_secret = True
         elif _breaks_git_flow(step):
             git_taint = False
+        if _write_plants_secret(step, cwd, blobs):
+            tree_secret = True
         if not destructive:
             _inspection_paths(step, cwd, listed, read)
         inspection_seen = inspection_seen or _is_inspection(step, destructive)

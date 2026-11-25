@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agentsentinel.corpus import CorpusRow
-from agentsentinel.rules import is_destructive, is_escalation, is_read, is_send
+from agentsentinel.rules import (
+    _sensitive_read,
+    is_destructive,
+    is_escalation,
+    is_read,
+    is_send,
+)
 from agentsentinel.trace import Step, normalize_trace
 
 ITERATIONS = 600
@@ -17,12 +23,29 @@ L2 = 0.02
 SEED = 0
 
 
+def _feature_tool(step: Step) -> str:
+    """Stored tool name. A benign ``exec`` is scored as ``shell``.
+
+    ``tool:exec`` was fit on destructive and privileged commands, so an
+    innocent ``exec`` crosses 0.5 by itself. The model is not refit. This is
+    a predict-time feature interaction: the stored name stays ``exec``, and
+    a risky exec (sensitive read, destruction, or high-privilege escalation)
+    keeps ``tool:exec``. ``functions.exec`` is a different stored string.
+    """
+    if step.tool != "exec":
+        return step.tool
+    if _sensitive_read(step) or is_destructive(step) or is_escalation(step):
+        return step.tool
+    return "shell"
+
+
 def extract_features(steps: Sequence[Step]) -> frozenset[str]:
     """Binary tool unigrams/bigrams, rule-family presence, and one length bucket."""
-    features = {f"tool:{step.tool}" for step in steps}
+    names = [_feature_tool(step) for step in steps]
+    features = {f"tool:{name}" for name in names}
     features.update(
-        "bigram:" + json.dumps([first.tool, second.tool], separators=(",", ":"))
-        for first, second in zip(steps, steps[1:], strict=False)
+        "bigram:" + json.dumps([first, second], separators=(",", ":"))
+        for first, second in zip(names, names[1:], strict=False)
     )
     for family, predicate in (
         ("read", is_read),

@@ -1,6 +1,6 @@
 # AgentSentinel specification
 
-The contract below describes the 0.7.0 scanner. Historical measurements stay
+The contract below describes the 0.8.0 scanner. Historical measurements stay
 in the benchmark reports.
 
 ## Public contract
@@ -100,7 +100,7 @@ calls. A dedicated send that occurs before any sensitive read stays clear.
 
 | Stable signal ID | Category | Weight | Trigger |
 | --- | --- | ---: | --- |
-| `exfil:read-then-send` | exfiltration | 0.85 | Sensitive read, then an external content send in the same scan, a `git_push` in the same flow, or a shell transfer of a sensitive path |
+| `exfil:read-then-send` | exfiltration | 0.85 | Sensitive read, then an external content send in the same scan, a `git_push` while git taint or a planted tree secret is set, or a shell transfer of a sensitive path |
 | `exfil:encoded-payload` | exfiltration | 0.10 | That send also contains a base64/hex-like contiguous blob of >=100 characters |
 | `destruction:protected-target` | destruction | 0.80 | Destructive operation targeting a protected or unknown location/database |
 | `destruction:no-prior-inspection` | destruction | 0.15 | Destructive operation with no earlier read/list/stat inspection |
@@ -117,31 +117,66 @@ trace, including one where no rule fires.
 ### Exfiltration
 
 File and variable reads include `file_read`, `read_file`, `cat`, `open`,
-`read_text`, and `env_read`. Sensitive arguments and non-prose field names
-match `.env`, `id_rsa`, `.ssh`, `credential(s)`, `secret(s)`, `token(s)`,
-`password(s)`, or `/etc/passwd`, case-insensitively. A sentence is not
-matched. Public SSH paths (`.ssh/*.pub`, `.ssh/known_hosts`,
-`.ssh/authorized_keys`) are excluded before that pattern. Private key
-basenames `id_rsa`, `id_ed25519`, `id_ecdsa`, and `id_dsa` are sensitive
-even outside `.ssh`. Environment tools are sensitive without a path: `env`,
-`printenv`, `env_dump`, `dump_env`, `get_env`, `list_env`,
-`environment_dump`. A real shell `env` or `printenv` dump is a sensitive
-read. `env curl` is a wrapped transfer, not a dump.
+`read_text`, and `env_read`. A sensitive word
+(`credential(s)`, `secret(s)`, `token(s)`, `password(s)`) matches only as
+the entire field or value, or as the last identifier of a path segment,
+case-insensitively. One trailing alphanumeric extension of at most 8
+characters is stripped first, except on a single-dot hidden name such as
+`.env`. `.env` filenames match, except the template suffixes `example`,
+`sample`, `template`, and `dist`, so `.env.example` does not.
+`tokenizer.py`, `secretary.txt`, and `token-format.md` do not match.
+`prod-secrets.json` and `service-token` do. `id_rsa` is matched as a whole
+token and is not split on the underscore. `.ssh` and `/etc/passwd` are
+separate patterns. A sentence is not matched. Public SSH paths
+(`.ssh/*.pub`, `.ssh/known_hosts`, `.ssh/authorized_keys`) are excluded
+before that pattern. Private key basenames `id_rsa`, `id_ed25519`,
+`id_ecdsa`, and `id_dsa` are sensitive even outside `.ssh`. Environment
+tools are sensitive without a path: `env`, `printenv`, `env_dump`,
+`dump_env`, `get_env`, `list_env`, `environment_dump`. A real shell `env`
+or `printenv` dump is a sensitive read. `env curl`, `env FOO=1 pytest`,
+and `env -i npm test` are wrappers, not dumps. `printenv HOME` is still a
+dump. The classifier's read-family check still treats a command whose
+first token is `env` as a read; only the sensitive-read rule uses the
+unwrapped program.
 
 A shell-family command that reads a sensitive path is a sensitive read with
 the same downstream taint as a read tool. It does not change the read-family
-feature used by the classifier. Readers are `cat`, `head`, `tail`, `tac`,
-`type`, `less`, `more`, `nl`, `od`, `xxd`, `base64`, `strings`, `bat`,
-`awk`, `sed -n`, `dd if=`, and an input redirect. Command substitution and
-process substitution of `cat`, `head`, `tail`, `type`, `base64`, and `nl`
-count. `cmd /c type` and PowerShell `Get-Content`, `gc`, `type`, and `cat`
-count. Literal Python `open(...).read()`, `Path.read_text()`, and
-`read_bytes()` inside the command count, including nested calls. Command
-text is read from `command`, `cmd`, `command_line`, `cmdline`, `script`,
-`code`, and `input`. Wrappers peeled before the program is recognized are
-`sudo`, `command`, `env` when it launches another program, `busybox`,
-`nice`, `nohup`, `time`, and `ionice`, including `/bin/cat` and
-`bash -lc 'cat'`. The same shell step can be both the read and the send.
+feature used by the classifier. The reader and the transfer parser share
+one lexer. A backslash is a bash escape, so `c\at` is `cat`. Unix paths are
+not rewritten by folding every `\` to `/`. A Windows drive-letter path is
+folded to slashes before the lexer, so `cmd /c type` and PowerShell
+`Get-Content` of `C:\Users\...` still see the path. Literal `NAME=value`
+and `export NAME=value` bindings are substituted into later `$NAME` and
+`${NAME}` uses outside single quotes. An unassigned `$HOME` stays a
+variable. Unquoted `<(...)` process substitutions are masked before the
+split so they do not break the surrounding command, then scanned as reads.
+Readers are `cat`, `head`, `tail`, `tac`, `type`, `less`, `more`, `nl`,
+`od`, `xxd`, `base64`, `strings`, `bat`, `awk`, `sed -n`, `dd if=`, and an
+input redirect. Command substitution, process substitution, and backticks
+of those readers count, including `/bin/cat` and a `sudo` or `command`
+prefix. One unmatched quote is dropped and the command is lexed again, up
+to eight times. If a quote is still open, the remaining quotes are stripped
+and the rest of the script is still analyzed. A nested `bash -c` or `sh -c`,
+including `-lc`, is opened, up to eight levels. Command text is read from
+`command`, `cmd`, `command_line`, `cmdline`, `script`, `code`, and `input`.
+Wrappers peeled before the program is recognized are `sudo`, `command`,
+`env` when it launches another program, `busybox`, `nice`, `nohup`,
+`time`, and `ionice`, including `/bin/cat` and `bash -lc 'cat'`. The same
+shell step can be both the read and the send.
+
+Python inside that command is parsed, not executed. A read counts for a
+literal `open`, `io.open`, `Path`, or `FileIO`, a name bound to one of
+those, `getattr` of `read`, `read_text`, or `read_bytes`, `os.open` paired
+with `os.read`, a path built with `+`, and `shutil.copy`, `copy2`, or
+`copyfile` of a real file. A `file://` `urlopen` is a read. A `python`
+heredoc body is included. Nested function bodies count as reads. The
+destruction walk still ignores them.
+
+A local `cp`, `mv`, `install`, or `rsync` of a sensitive source is a read
+for taint. The destination identity is available in that same step, so a
+dynamic upload of the staged path matches. A remote `rsync` or `scp`
+destination is a transfer, not a local copy. A copy whose destination is
+outside `/tmp` and `/var/tmp` also plants the tree latch below.
 
 For `db_query`, a `SELECT` mentioning identifiers such as `customer_records`,
 `email`, `password_hash`, or `api_key` is a sensitive read. The same rule
@@ -160,24 +195,36 @@ string in the step. A string is a path when its field is a path field
 `src`), or when it contains a slash or backslash and is not prose. Segments
 join only inside one field, or as a declared directory-role field
 (`directory`, `dir`, `folder`, `dirname`, `parent`, `dir_path`,
-`folder_path`) plus a filename-role field (`filename`, `file`, `basename`,
-`file_name`, `name`). A same-field list that mixes a directory and a
-filename is paired even when argument walk order is reversed. Unrelated
+`folder_path`, `working_directory`, `workdir`, `root`) plus a filename-role
+field (`filename`, `file`, `basename`, `file_name`, `name`, `relative`) in
+the same object. A directory-role field also joins a single-segment
+`path`, `paths`, `file_path`, `filepath`, or `full` in that same object.
+A same-field list is joined in source order, and a directory entry in that
+list is also paired with each single-segment filename, including when walk
+order is reversed. A whitespace or longer-than-1024 sibling is skipped. It
+does not cancel the rest of the field. Two objects are not crossed:
+`left.path` and `right.path` stay separate, and two files in one batch do
+not cross-product. `cwd` is not a directory-role field. A relative path is
+still resolved against the last absolute working directory. Unrelated
 fields are not crossed, so `context=/home/op/.kube` plus `topic=config` is
 not `.kube/config`.
 
-Each candidate is decoded to a fixed point, at most eight passes: percent-
-decode, fold backslashes to slashes, cut at a NUL, and strip whitespace and
-C0/DEL. `normpath` runs once after that loop, so a decode cannot rebuild a
+Each candidate is decoded to a fixed point, at most `min(len(value), 64)`
+passes: percent-decode, fold backslashes to slashes, cut at a NUL, and
+strip whitespace and C0/DEL. The loop stops when a pass changes nothing.
+`normpath` runs once after that loop, so a decode cannot rebuild a
 separator the fold already removed. `$VAR` and `${VAR}` become a `VAR`
-placeholder before `normpath`, so `..` still folds. Double encodings such as
+placeholder before `normpath`, so `..` still folds. Nine layers of `%25`
+before `2E` still resolve. A longer chain stops at 64 passes, which keeps
+a pathological input to a linear number of passes. Double encodings such as
 `%252E` and `%2563`, and `%5c` / `%00`, therefore match the same concept as
 the raw path. A trailing `/..` still names the parent. Percent-decoding
 `%2f..` still collapses, the same way `normpath` collapses a raw `../`.
 
 The concept pattern must match that whole normalized path. A sentence that
-only mentions a filename does not match. Legacy tokens still match non-prose
-field names and non-prose values, not the joined step text.
+only mentions a filename does not match. Legacy tokens match a non-prose
+field name or value under the last-identifier rule above, not the joined
+step text.
 
 Kubeconfig matches `.kube/config` or `.kube/admin.conf` with an optional
 `yml`/`yaml`/`json`/`bak`/`old` suffix, a basename containing `kubeconfig`
@@ -228,7 +275,20 @@ commit`, `git rm`, or `git mv` clears git taint before the push is judged.
 `file_write` and those git mutations do not. The read itself is not a
 break. An external `git_push` immediately after reading `.env` still flags.
 The same push after a listing, a README read, and `pytest` does not, unless
-the classifier flags on its own.
+a tree secret was planted or the classifier flags on its own.
+
+A third latch, the tree secret, never clears. It is set when a `file_write`
+body contains a prior sensitive-read result and the written path is absolute
+and outside `/tmp` and `/var/tmp`. The result is stored only when, after
+stripping, it is at least 12 characters and at most 8192, and at most 32
+such blobs are kept. The blob must occur inside the body. It is also set
+when a local copy of a sensitive source lands outside that scratch. An
+external `git_push` flags when git taint or the tree secret is set. A shell
+`git push` of a literal external URL is that same push, not a content sink.
+`read .env`, then `pytest`, then `git push` stays clear. `git add`,
+`git commit`, and `git push` of a literal external URL after a planted
+secret flags. A named remote with no literal host stays unresolved. A
+dynamic `git push "$REMOTE"` is not a content send.
 
 Sends are checked before taint is updated, except a shell command that both
 reads and transfers. A same-step transfer flags when a sensitive operand is
@@ -258,7 +318,13 @@ inside an explicitly internal backup's payload as destinations.
 
 Shell sends include `curl` with upload, body, or write-method options,
 `wget` with body or write-method options, `scp` and `rsync` with a remote
-destination, and outbound `nc`, `netcat`, and `ncat` connections. Plain HTTP
+destination, outbound `nc`, `netcat`, and `ncat` connections, `mail` to an
+address, `openssl s_client -connect host:port`, and Python
+`urllib.request.urlopen` of an `http` or `https` URL. `openssl` counts only
+when the program is `openssl` and the subcommand is `s_client`. A `file://`
+urlopen is a read, not a send. These sends honor a sensitive read already
+in the trace, including a read in the same command. `ssh` with a stdin
+redirect is not a send. Plain HTTP
 fetches, incoming copies, netcat listen mode, and port probes supply no send
 evidence. The rule uses the parsed destination and the same literal host check
 as dedicated sends. A destination expressed as a shell expansion requires a
@@ -357,11 +423,14 @@ are not scratch for this rule: a production file there is live.
 `file_write` and its `save_document` alias have no separate overwrite verb.
 A write onto a protected location always counts. Protected locations are a
 kubeconfig, anything under `/etc`, a path with a `live` segment, and a file
-whose first segment is `workspace` or `workspaces`. Elsewhere a non-empty
-`content`, `text`, `data`, or `body` is an ordinary project edit and does
-not count. Empty, whitespace-only, or absent content is still a truncate,
-including a relative `config/production.yaml` whose working directory makes
-it live. A note that merely mentions `production.yaml` is not joined onto
+whose first segment is `workspace` or `workspaces`. Elsewhere any non-empty
+body is an ordinary project edit and does not count. A body is every string
+argument that is not a location field or a metadata field. `contents`,
+`source`, `file_contents`, and `new_content` are bodies. `source` and `src`
+remain path fields as well. Empty, whitespace-only, or absent bodies are
+still a truncate, including a relative `config/production.yaml` whose
+working directory makes it live. If any body is empty, the write still
+truncates. A note that merely mentions `production.yaml` is not joined onto
 another path.
 
 Shell counts `>`, `>|`, and `&>` (not `>>`) onto any live config,
@@ -394,7 +463,8 @@ grants through `usermod`, `useradd`, `adduser`, or `gpasswd` qualify when they
 name a privileged group such as `sudo` or `wheel`. Literal shell writes and
 edits to `/etc/sudoers` or a file under `/etc/sudoers.d/` count as privilege
 operations. A dedicated file write to a sudo policy path also counts when its
-content contains an uncommented assignment with a `NOPASSWD:` command grant.
+content, in any body field, contains an uncommented assignment with a
+`NOPASSWD:` command grant.
 
 The then-act rule counts any later send, including an internal send, or any
 later destructive operation, including a scratch deletion. Both weights of the
@@ -414,6 +484,14 @@ Features are binary presence (not counts):
   admin operations from elevated grants in otherwise identical sequences.
 - Exactly one length bucket: `length:0`, `length:1`, `length:2-3`, `length:4-7`,
   or `length:8+`.
+
+At prediction time, a step whose stored tool is exactly `exec`, and that is
+not a sensitive read, a destructive operation, or a high-privilege
+escalation, contributes `tool:shell` and shell bigrams instead of
+`tool:exec`. A risky `exec` keeps `tool:exec`. `functions.exec` is a
+different stored string and is unchanged. The shipped model is not refit.
+`tool:exec` was fit on destructive and privileged commands, so an innocent
+`exec` would otherwise cross 0.5 from that feature shape alone.
 
 Vocabulary is the sorted union of training features only; unseen features have
 no learned weight. For each feature, compute its training mean `m` and standard
@@ -505,7 +583,7 @@ destruction (13/14), and 1.0000 for privilege escalation (10/10). The threshold
 sweep is descriptive. The published cutoff stayed at 0.5 throughout the
 experiment. [Independent benchmark report](evals/results/benchmark-v0.3.0.md)
 Later releases keep the 0.5 threshold. Current measurements are in
-[evals/results/benchmark-v0.7.0.md](evals/results/benchmark-v0.7.0.md).
+[evals/results/benchmark-v0.8.0.md](evals/results/benchmark-v0.8.0.md).
 
 ## Limits
 
@@ -514,19 +592,29 @@ probabilistic union. Synthetic training support is tiny. Feature collisions
 between benign and malicious sequences make perfect separation impossible in
 some cases; the classifier intentionally does not learn paths or destinations.
 Tool names outside the alias map and the evident-action table still pass
-through. One-step transfers the shell parser does not treat as sends
-(`python -c` with `urllib.request.urlopen`, `mail`, `openssl s_client`) are
-not exfiltration by themselves. Shell and SQL handling use lexical
-heuristics. Python analysis covers literal, straight-line calls. A `.pem`
-result that is an explicit public key or certificate still classifies that
-ambiguous extension as public. Double-decoding `%2f..` still collapses the
-way `normpath` collapses `../`. Kubeconfig suffixes outside
-`yml`/`yaml`/`json`/`bak`/`old` do not match. DNS, symlinks, permissions,
-actual tool success, authorization, and causal dataflow are unknown. Internal
-hosts can be attacker-controlled; external destinations can be legitimate.
-Legacy secret-name matching can still overmatch a non-prose value. Prior
-unrelated inspection suppresses only the no-inspection signal. Content taint
-survives ordinary later reads; git-push taint does not. Malformed/dropped
-evidence can lower the score. No input-size/time/memory limits are promised.
-This package scans supplied traces and never executes their tools; it is not
-a sandbox or a replacement for application policy enforcement.
+through. `node` `readFileSync`, `perl -e`, and sourcing a `.env` file are
+not readers. `timeout`, `stdbuf`, `eval`, `xargs`, and `find -exec` are not
+peeled. `ssh` with a stdin redirect is not a send. A shell `git push` of a
+named remote without a literal host may stay unresolved. `printenv HOME` is
+still an environment dump. Shell and SQL handling use lexical heuristics.
+Python analysis covers the indirect forms above and still misses many
+dynamic calls. A `.pem` result that is an explicit public key or certificate
+still classifies that ambiguous extension as public. An empty or redacted
+`.pem` stays sensitive. Percent-decoding stops after `min(len(value), 64)`
+passes, and `%2f..` still collapses the way `normpath` collapses `../`. A
+trailing `/..` names the parent. Kubeconfig suffixes outside
+`yml`/`yaml`/`json`/`bak`/`old` do not match. A path whose basename is
+`license.key` still matches the `.key` rule. A non-empty edit of a project
+path that normalizes out of a sample tree is an ordinary edit; an empty
+write of that path still flags. DNS, symlinks, permissions, actual tool
+success, authorization, and causal dataflow are unknown. Internal hosts can
+be attacker-controlled; external destinations can be legitimate. A field
+whose entire value is `token` still matches. Prior unrelated inspection
+suppresses only the no-inspection signal. Content taint and a planted tree
+secret survive ordinary later reads. Git-push taint does not, and none of
+the latches cross `scan()` calls. A dedicated send that precedes every
+sensitive read stays clear of the exfiltration rule. Malformed evidence is
+ignored rather than raising. No input-size or time limit is promised beyond
+the 64-pass decode bound. This package scans supplied traces and never
+executes their tools; it is not a sandbox or a replacement for application
+policy enforcement.

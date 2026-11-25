@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.8.0
+
+- Share one shell lexer between the reader and the transfer parser. A
+  backslash is a bash escape, not a blanket fold to `/`. Windows
+  drive-letter paths are folded before the lexer. Literal `NAME=value`
+  bindings, backticks, and process substitutions are read forms. One
+  unmatched quote is repaired (at most eight drops, then the remaining
+  quotes are stripped) so the rest of the script is still analyzed. A
+  nested `bash -c` or `sh -c` is opened, at most eight levels.
+- Count indirect Python reads: a name bound to `open` or `Path`,
+  `getattr` of `read` / `read_text` / `read_bytes`, `io.open` and
+  `FileIO`, `os.open` with `os.read`, string concatenation, a `python`
+  heredoc, and `shutil.copy` / `copy2` / `copyfile` of a real file.
+  `file://` `urlopen` is a read.
+- Treat a local `cp`, `mv`, `install`, or `rsync` of a sensitive source
+  as a read. The staged path is an identity in that same step, so a
+  dynamic upload of it matches.
+- Keep a tree latch when a sensitive result is written or copied outside
+  `/tmp` and `/var/tmp`. The latch never clears. An external `git_push`,
+  including a shell `git push` of a literal external URL, stays tainted
+  after `git status`, a README read, or `pytest`. Ordinary repo work
+  that never plants the secret still clears the git flow. A shell
+  `git push` is not a content sink.
+- Treat `urllib.request.urlopen`, `mail`, and `openssl s_client` as
+  sends that honor a sensitive read already in the trace, including the
+  same command. `openssl` counts only with subcommand `s_client`.
+- Join path pieces in source order inside one field, and pair a
+  directory-role field with a filename or a single-segment path only
+  inside the same object. A whitespace or over-long sibling is skipped
+  instead of cancelling the field. Sibling objects do not cross.
+- Match a legacy secret word only as the whole field or as the last
+  identifier of a path segment. `.env` filenames match except the
+  template suffixes `example`, `sample`, `template`, and `dist`.
+  `env pytest` is a wrapper, not a dump. `printenv` with no command is
+  still a dump. The classifier read-family check is unchanged.
+- Treat every non-location, non-metadata string as a write body, so a
+  project edit under `contents` or `source` is not a truncate. An empty
+  body, an absent body, and a protected location still are.
+- At prediction time, score a benign stored tool `exec` as `shell`. A
+  risky `exec` keeps `tool:exec`. The model was not refit.
+- Decode a path to a fixed point, at most `min(len(value), 64)` passes,
+  then run `normpath` once. Nine layers of `%25` before `2E` resolve.
+- The classifier was not refit. The independent benchmark is unchanged:
+  precision 0.8889, recall 1.0000, F1 0.9412, FPR 0.0625, TP=40 FP=5
+  TN=75 FN=0. Every family stays at 1.0000.
+- TrustBreaker trace evasion re-measured twice with byte-identical
+  aggregates: bypass 3.72%, robustness 96.28% (v0.7.0: 3.84% / 96.16% on
+  the same 45 flagged originals and 1,745 applicable variants; 65 bypasses
+  instead of 67).
+
 ## 0.7.0
 
 - Treat a shell command that reads a sensitive path as a sensitive read, with

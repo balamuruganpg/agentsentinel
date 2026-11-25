@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentsentinel"
-version = "0.7.0"
+version = "0.8.0"
 description = "Rules and a learned sequence classifier for unsafe agent tool traces"
 readme = "README.md"
 requires-python = ">=3.11"

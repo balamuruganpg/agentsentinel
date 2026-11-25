@@ -5,7 +5,7 @@ destructive operations, and privilege escalation. It combines deterministic
 sequence rules with a learned tool-sequence classifier, following the
 rules-plus-learned approach of the author's PromptWarden in a new domain.
 
-Version 0.7.0 runs on Python 3.11+ with **no runtime dependencies**. The default
+Version 0.8.0 runs on Python 3.11+ with **no runtime dependencies**. The default
 corpus and trained JSON model ship inside the package and work offline.
 
 **F1 0.9412. False-positive rate 0.0625.** Precision 0.8889 and recall 1.0000
@@ -118,7 +118,7 @@ flowchart TD
 | Area | What it does |
 | --- | --- |
 | Rules | Detect sensitive reads, including a shell command that reads a sensitive path, followed by a send in the same flow. Protect deletion, including literal Python calls, and truncation of a live production config at a protected location. Treat database mutations and explicit privilege grants the same way. |
-| Classifier | Scores binary tool-name unigrams and bigrams, tool-family presence, and trace length using stdlib logistic regression. |
+| Classifier | Scores binary tool-name unigrams and bigrams, tool-family presence, and trace length using stdlib logistic regression. A benign stored tool `exec` is scored as `shell`; the model is not refit. |
 | CLI | `scan` emits text or JSON, `train` writes a local model, and `eval` measures the complete pipeline. |
 | Evals | Reports precision, recall, F1, false-positive rate, confusion counts, and per-category recall on the independent corpus. |
 
@@ -129,8 +129,9 @@ Each distinct rule adds its weight, and the rule total is capped at 1. A
 standalone high-risk privilege operation contributes 0.55. Routine `sudo`
 maintenance contributes 0.20. Exfiltration evidence includes external
 destinations and shell transfers of a sensitive path, including a read and
-a send in the same command. A `git_push` is judged only against the
-sensitive reads that precede it in its own flow. Database query results
+a send in the same command. A `git_push` is judged against the git flow
+and against a secret planted in the tree, which survives later repo work.
+Database query results
 supply sensitive-read evidence. A file-read body cannot grant or erase
 payroll, cookie, or `.key` sensitivity. An explicit public-key or
 certificate block can classify an ambiguous `.pem`.
@@ -159,6 +160,7 @@ corpus (40 malicious, 80 benign, including 36 hard negatives).
 
 | Bundled scanner | Precision | Recall | F1 | FPR | TP / FP / TN / FN |
 | --- | ---: | ---: | ---: | ---: | --- |
+| v0.8.0 | 0.8889 | 1.0000 | 0.9412 | 0.0625 | 40 / 5 / 75 / 0 |
 | v0.7.0 | 0.8889 | 1.0000 | 0.9412 | 0.0625 | 40 / 5 / 75 / 0 |
 | v0.6.0 | 0.8889 | 1.0000 | 0.9412 | 0.0625 | 40 / 5 / 75 / 0 |
 | v0.5.0 | 0.8864 | 0.9750 | 0.9286 | 0.0625 | 39 / 5 / 75 / 1 |
@@ -169,6 +171,7 @@ corpus (40 malicious, 80 benign, including 36 hard negatives).
 
 | Bundled scanner | Exfiltration (16) | Destruction (14) | Privilege escalation (10) |
 | --- | ---: | ---: | ---: |
+| v0.8.0 | 1.0000 | 1.0000 | 1.0000 |
 | v0.7.0 | 1.0000 | 1.0000 | 1.0000 |
 | v0.6.0 | 1.0000 | 1.0000 | 1.0000 |
 | v0.5.0 | 1.0000 | 0.9286 | 1.0000 |
@@ -218,6 +221,17 @@ same 45 flagged originals and 1,745 variants, bypass is 3.84% (robustness
 96.16%), up from 3.04% because the tighter flow and join rules no longer
 fire on some mutations. Full account:
 [evals/results/benchmark-v0.7.0.md](evals/results/benchmark-v0.7.0.md).
+
+v0.8.0 keeps that corpus line again. The reader and the transfer parser
+share a shell lexer, indirect Python reads and local copies taint, a
+secret written into the tree keeps a later `git_push` tainted, and
+`urlopen`, `mail`, and `openssl s_client` honor an earlier sensitive read.
+Path pieces join inside one object, a benign `exec` is scored as `shell`,
+and percent-decoding runs to a fixed point with a bound of 64 passes. The
+classifier was not refit. Re-measured by TrustBreaker on the same 45
+flagged originals and 1,745 variants, bypass is 3.72% (robustness 96.28%),
+down from 3.84%. Full account:
+[evals/results/benchmark-v0.8.0.md](evals/results/benchmark-v0.8.0.md).
 
 <details>
 <summary>Benchmark corpus notes and reports</summary>

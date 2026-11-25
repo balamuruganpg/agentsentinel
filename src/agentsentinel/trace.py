@@ -211,6 +211,10 @@ class Step:
     # Read results corroborate path evidence. They are not argument text, so a
     # secret mentioned in a file body cannot become a path match by itself.
     result: str = ""
+    # Container id and source index for each field. Joins stay inside one
+    # object or one list; same-named keys from sibling objects do not cross.
+    field_origins: tuple[int, ...] = ()
+    field_indexes: tuple[int, ...] = ()
 
     @property
     def text(self) -> str:
@@ -224,29 +228,47 @@ class Step:
 
 def _strings(
     value: object,
-) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+) -> tuple[
+    tuple[str, ...], tuple[tuple[str, str], ...], tuple[int, ...], tuple[int, ...]
+]:
     # Iteration and identity tracking also tolerate cyclic non-JSON Python inputs.
-    pending: list[tuple[str, object]] = [("", value)]
+    # Each string remembers the container that held it and its source index.
+    # The walk is still a stack, so field order is unchanged; the index puts a
+    # path list back into source order at join time.
+    pending: list[tuple[str, object, int, int]] = [("", value, 0, 0)]
     seen: set[int] = set()
     strings: list[str] = []
     fields: list[tuple[str, str]] = []
+    origins: list[int] = []
+    indexes: list[int] = []
+    next_id = 1
     while pending:
-        field, item = pending.pop()
+        field, item, origin, index = pending.pop()
         if isinstance(item, str):
             strings.append(item)
             fields.append((field.lower(), item))
+            origins.append(origin)
+            indexes.append(index)
         elif isinstance(item, (dict, list)):
             if id(item) in seen:
                 continue
             seen.add(id(item))
+            container = next_id
+            next_id += 1
             if isinstance(item, dict):
-                for key, child in item.items():
+                children: list[tuple[str, object, int, int]] = []
+                for key_index, (key, child) in enumerate(item.items()):
                     if isinstance(key, str):
                         strings.append(key)
-                    pending.append((key if isinstance(key, str) else field, child))
+                    child_field = key if isinstance(key, str) else field
+                    children.append((child_field, child, container, key_index))
+                pending.extend(children)
             else:
-                pending.extend((field, child) for child in item)
-    return tuple(strings), tuple(fields)
+                pending.extend(
+                    (field, child, container, child_index)
+                    for child_index, child in enumerate(item)
+                )
+    return tuple(strings), tuple(fields), tuple(origins), tuple(indexes)
 
 
 def normalize_trace(trace: dict[str, object]) -> tuple[Step, ...]:
@@ -264,13 +286,23 @@ def normalize_trace(trace: dict[str, object]) -> tuple[Step, ...]:
         args = step.get("args", {})
         if not isinstance(args, dict):
             continue
-        arguments, fields = _strings(args)
+        arguments, fields, origins, indexes = _strings(args)
         tool = _camel_to_snake(tool.strip()).lower()
         tool = _CANONICAL_TOOL_NAMES.get(tool, tool)
         raw_result = step.get("result")
         result_text = raw_result if isinstance(raw_result, str) else ""
         result_fields: tuple[tuple[str, str], ...] = ()
         if _family_name(tool) == "db_query":
-            _, result_fields = _strings(raw_result)
-        normalized.append(Step(tool, arguments, fields, result_fields, result_text))
+            _, result_fields, _, _ = _strings(raw_result)
+        normalized.append(
+            Step(
+                tool,
+                arguments,
+                fields,
+                result_fields,
+                result_text,
+                origins,
+                indexes,
+            )
+        )
     return tuple(normalized)
