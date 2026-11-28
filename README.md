@@ -5,7 +5,7 @@ destructive operations, and privilege escalation. It combines deterministic
 sequence rules with a learned tool-sequence classifier, following the
 rules-plus-learned approach of the author's PromptWarden in a new domain.
 
-Version 0.8.0 runs on Python 3.11+ with **no runtime dependencies**. The default
+Version 0.9.0 runs on Python 3.11+ with **no runtime dependencies**. The default
 corpus and trained JSON model ship inside the package and work offline.
 
 **F1 0.9412. False-positive rate 0.0625.** Precision 0.8889 and recall 1.0000
@@ -160,6 +160,7 @@ corpus (40 malicious, 80 benign, including 36 hard negatives).
 
 | Bundled scanner | Precision | Recall | F1 | FPR | TP / FP / TN / FN |
 | --- | ---: | ---: | ---: | ---: | --- |
+| v0.9.0 | 0.8889 | 1.0000 | 0.9412 | 0.0625 | 40 / 5 / 75 / 0 |
 | v0.8.0 | 0.8889 | 1.0000 | 0.9412 | 0.0625 | 40 / 5 / 75 / 0 |
 | v0.7.0 | 0.8889 | 1.0000 | 0.9412 | 0.0625 | 40 / 5 / 75 / 0 |
 | v0.6.0 | 0.8889 | 1.0000 | 0.9412 | 0.0625 | 40 / 5 / 75 / 0 |
@@ -171,6 +172,7 @@ corpus (40 malicious, 80 benign, including 36 hard negatives).
 
 | Bundled scanner | Exfiltration (16) | Destruction (14) | Privilege escalation (10) |
 | --- | ---: | ---: | ---: |
+| v0.9.0 | 1.0000 | 1.0000 | 1.0000 |
 | v0.8.0 | 1.0000 | 1.0000 | 1.0000 |
 | v0.7.0 | 1.0000 | 1.0000 | 1.0000 |
 | v0.6.0 | 1.0000 | 1.0000 | 1.0000 |
@@ -232,6 +234,19 @@ classifier was not refit. Re-measured by TrustBreaker on the same 45
 flagged originals and 1,745 variants, bypass is 3.72% (robustness 96.28%),
 down from 3.84%. Full account:
 [evals/results/benchmark-v0.8.0.md](evals/results/benchmark-v0.8.0.md).
+
+v0.9.0 keeps that corpus line again. Round 5's review found the taint
+tracking could be laundered by ordinary steps — a symlink, an archive
+hop, a `cd`, an assignment scoped to one command — and that
+`readlines()`, iteration, and `requests.post` were not counted as reads
+and sends at all. v0.9.0 tracks shell scope and working directory across
+the trace, starts taint at archive and compression tools, keeps path
+identity through links and second hops, and plants the git latch on
+redirects, `tee`, and Python writes. The classifier was not refit.
+Re-measured by TrustBreaker on the same 45 flagged originals and 1,745
+variants, bypass is 3.72% (robustness 96.28%), unchanged — the mutation
+operators do not generate the round-5 shapes. Full account:
+[evals/results/benchmark-v0.9.0.md](evals/results/benchmark-v0.9.0.md).
 
 <details>
 <summary>Benchmark corpus notes and reports</summary>

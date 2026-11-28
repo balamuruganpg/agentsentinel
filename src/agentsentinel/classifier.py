@@ -39,6 +39,25 @@ def _feature_tool(step: Step) -> str:
     return "shell"
 
 
+def _classifier_steps(steps: Sequence[Step]) -> Sequence[Step]:
+    """Hide one step that sits between ``file_write`` and ``http_post``.
+
+    The bundled model learned that pair only as an adjacent bigram. At
+    prediction time a single intervening step is left out of the feature
+    view, so the trained bigram still applies. Training and
+    ``extract_features`` are unchanged. Two intervening steps are not bridged.
+    """
+    names = [_feature_tool(step) for step in steps]
+    hidden = {
+        index + 1
+        for index in range(len(names) - 2)
+        if names[index] == "file_write" and names[index + 2] == "http_post"
+    }
+    if not hidden:
+        return steps
+    return [step for index, step in enumerate(steps) if index not in hidden]
+
+
 def extract_features(steps: Sequence[Step]) -> frozenset[str]:
     """Binary tool unigrams/bigrams, rule-family presence, and one length bucket."""
     names = [_feature_tool(step) for step in steps]
@@ -87,7 +106,7 @@ class LogisticModel:
     training_rows: int = 0
 
     def predict_probability(self, steps: Sequence[Step]) -> float:
-        features = extract_features(steps)
+        features = extract_features(_classifier_steps(steps))
         logit = self.bias + sum(
             weight * ((float(name in features) - mean) / scale)
             for name, weight, mean, scale in zip(
@@ -100,13 +119,13 @@ class LogisticModel:
         """Present features with positive standardized contributions, if positive."""
         if self.predict_probability(steps) < self.threshold:
             return ()
-        features = extract_features(steps)
+        viewed = extract_features(_classifier_steps(steps))
         return tuple(
             f"feature:{name}"
             for name, weight, mean in zip(
                 self.vocabulary, self.weights, self.means, strict=True
             )
-            if name in features and weight > 0.0 and mean < 1.0
+            if name in viewed and weight > 0.0 and mean < 1.0
         )
 
     def to_json(self) -> str:

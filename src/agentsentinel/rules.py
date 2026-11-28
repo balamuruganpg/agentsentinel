@@ -1,5 +1,6 @@
 """Deterministic, ordered evidence rules. Weights are specified in SPEC.md."""
 
+import hashlib
 import ipaddress
 import posixpath
 import re
@@ -10,14 +11,23 @@ from urllib.parse import unquote, urlsplit
 from agentsentinel._shell import (
     COMMAND_FIELDS,
     SHELL_TOOLS,
+    ShellScope,
     ShellTransfer,
+    _resolve_path,
+    _substitute_assignments,
+    activate_scope,
     command_arguments,
+    iter_shell_commands,
+    restore_scope,
+    scope_cwd,
     shell_commands,
+    shell_directory_after,
     shell_git_push_remotes,
     shell_local_copies,
     shell_python_overwrites,
     shell_python_targets,
     shell_read_operands,
+    shell_split_prefixes,
     shell_transfers,
     unwrap_command,
 )
@@ -568,7 +578,8 @@ def _shell_always_protected(step: Step) -> bool:
 
 
 def _shell_rm_targets(step: Step) -> Iterator[str]:
-    for raw_command in shell_commands(step):
+    start = scope_cwd() or _reported_cwd(step)
+    for raw_command, command_cwd in iter_shell_commands(step, start):
         command = unwrap_command(raw_command)
         if not command or posixpath.basename(command[0]).lower() != "rm":
             continue
@@ -585,7 +596,11 @@ def _shell_rm_targets(step: Step) -> Iterator[str]:
             else:
                 operands.append(word)
         if aggressive:
-            yield from operands or [""]
+            if not operands:
+                yield ""
+                continue
+            for operand in operands:
+                yield _resolve_path(operand, command_cwd) if command_cwd else operand
 
 
 def _shell_deletion_targets(step: Step) -> tuple[str, ...]:
@@ -644,11 +659,18 @@ def _cloud_iam_grant(program: str, words: list[str]) -> bool:
     )
 
 
-def _shell_privilege_change(program: str, words: list[str]) -> bool:
+def _policy_operand(value: str, cwd: str) -> str:
+    """Resolve a relative policy path against the command's directory."""
+    if not cwd or not value or value.startswith("-"):
+        return value
+    return _resolve_path(value, cwd)
+
+
+def _shell_privilege_change(program: str, words: list[str], cwd: str = "") -> bool:
     if _privileged_group_change(program, words) or _cloud_iam_grant(program, words):
         return True
     if any(
-        word in {">", ">>", ">|"} and _sudo_policy_path(path)
+        word in {">", ">>", ">|"} and _sudo_policy_path(_policy_operand(path, cwd))
         for word, path in zip(words, words[1:], strict=False)
     ):
         return True
@@ -657,12 +679,14 @@ def _shell_privilege_change(program: str, words: list[str]) -> bool:
             value for option, value in command_arguments(words, set()) if not option
         ]
         if program in {"tee", "sudoedit"}:
-            return any(_sudo_policy_path(path) for path in operands)
+            return any(
+                _sudo_policy_path(_policy_operand(path, cwd)) for path in operands
+            )
         if program == "sed" and not any(
             word.startswith(("-i", "--in-place")) for word in words
         ):
             return False
-        return bool(operands) and _sudo_policy_path(operands[-1])
+        return bool(operands) and _sudo_policy_path(_policy_operand(operands[-1], cwd))
     return False
 
 
@@ -726,12 +750,13 @@ def _privilege_weight(step: Step) -> float:
         return low
 
     weight = 0.0
-    for command in shell_commands(step):
+    start = scope_cwd() or _reported_cwd(step)
+    for command, command_cwd in iter_shell_commands(step, start):
         program = posixpath.basename(command[0])
         arguments = " ".join(command[1:])
         invoked = unwrap_command(command)
         if invoked and _shell_privilege_change(
-            posixpath.basename(invoked[0]), invoked[1:]
+            posixpath.basename(invoked[0]), invoked[1:], command_cwd
         ):
             return high
         if (
@@ -1120,7 +1145,7 @@ def _wiping_sed(words: list[str]) -> bool:
 
 
 def _shell_config_overwrite(step: Step, cwd: str) -> bool:
-    for raw_command in shell_commands(step):
+    for raw_command, command_cwd in iter_shell_commands(step, cwd):
         command = unwrap_command(raw_command)
         if not command:
             continue
@@ -1128,7 +1153,7 @@ def _shell_config_overwrite(step: Step, cwd: str) -> bool:
         words = command[1:]
         arguments = list(command_arguments(words, {"-s", "--size"}))
         if any(
-            option in {">", ">|", "&>"} and _is_live_config(value, cwd)
+            option in {">", ">|", "&>"} and _is_live_config(value, command_cwd)
             for option, value in arguments
         ):
             return True
@@ -1138,12 +1163,14 @@ def _shell_config_overwrite(step: Step, cwd: str) -> bool:
                 option in {"-s", "--size"} and _zero_size(value)
                 for option, value in arguments
             )
-            if sized and any(_is_live_config(operand, cwd) for operand in operands):
+            if sized and any(
+                _is_live_config(operand, command_cwd) for operand in operands
+            ):
                 return True
         if program in {"cp", "mv", "install", "rsync"}:
             operands = [value for option, value in arguments if not option]
-            if len(operands) >= 2 and _is_live_config(operands[-1], cwd):
-                destination = _candidate_for_match(operands[-1], cwd)
+            if len(operands) >= 2 and _is_live_config(operands[-1], command_cwd):
+                destination = _candidate_for_match(operands[-1], command_cwd)
                 if operands[0] in _NULL_DEVICES or _protected_config_location(
                     destination
                 ):
@@ -1151,9 +1178,9 @@ def _shell_config_overwrite(step: Step, cwd: str) -> bool:
         if program == "tee":
             operands = [value for option, value in arguments if not option]
             if any(
-                _protected_config_location(_candidate_for_match(operand, cwd))
+                _protected_config_location(_candidate_for_match(operand, command_cwd))
                 for operand in operands
-                if _is_live_config(operand, cwd)
+                if _is_live_config(operand, command_cwd)
             ):
                 return True
         if program == "dd":
@@ -1164,7 +1191,7 @@ def _shell_config_overwrite(step: Step, cwd: str) -> bool:
                 key, _, value = token.partition("=")
                 params[key] = value
             if params.get("if") in _NULL_DEVICES and _is_live_config(
-                params.get("of", ""), cwd
+                params.get("of", ""), command_cwd
             ):
                 return True
         if program == "sed" and _wiping_sed(words):
@@ -1174,7 +1201,7 @@ def _shell_config_overwrite(step: Step, cwd: str) -> bool:
                 if not word.startswith("-")
                 and _WIPE_SUBSTITUTION.fullmatch(word.strip("'\"")) is None
             ]
-            if any(_is_live_config(operand, cwd) for operand in operands):
+            if any(_is_live_config(operand, command_cwd) for operand in operands):
                 return True
     return False
 
@@ -1224,8 +1251,12 @@ _BODY_SKIP = (
     | {"cwd", "working_directory", "workdir"}
 ) - {"source", "src"}
 _SECRET_BLOB_MIN = 12
-_SECRET_BLOB_MAX = 8192
-_SECRET_BLOB_CAP = 32
+# Full text is kept for substring checks. A later exact write still matches
+# through the hash set when the text is longer than this, or when the text
+# list is full. Neither store is unbounded.
+_SECRET_BLOB_MAX = 65536
+_SECRET_BLOB_CAP = 256
+_SECRET_HASH_CAP = 8192
 
 
 def _write_bodies(step: Step) -> list[str]:
@@ -1394,14 +1425,20 @@ def _literal_external_transfer(transfer: ShellTransfer) -> bool:
 
 
 def _dynamic_identity_match(
-    transfer: ShellTransfer, cwd: str, identities: set[str]
+    transfer: ShellTransfer,
+    cwd: str,
+    identities: set[str],
+    prefixes: set[str],
 ) -> bool:
     if not transfer.dynamic_destination:
         return False
-    return any(
-        (identity := _path_identity(source, cwd)) and identity in identities
-        for source in transfer.files
-    )
+    for source in transfer.files:
+        identity = _path_identity(source, cwd)
+        if identity and identity in identities:
+            return True
+        if _split_piece(identity or _candidate_for_match(source, cwd), prefixes):
+            return True
+    return False
 
 
 def _shell_step_exfil(
@@ -1411,11 +1448,13 @@ def _shell_step_exfil(
     shell_sources: Sequence[str],
     env_dump: bool,
     identities: set[str],
+    prefixes: set[str],
 ) -> bool:
     """A shell transfer after a sensitive read, including the same command.
 
     Literal external hosts do not need the same path. A dynamic destination
-    matches a stored identity, including ``$VAR`` paths folded to ``VAR``.
+    matches a stored identity, including ``$VAR`` paths folded to ``VAR``,
+    a copy or link destination, and a ``split`` piece of a known prefix.
     A same-step read (``cat secret | curl``, ``curl -T secret``) counts even
     though the latch updates after the send check.
     """
@@ -1429,7 +1468,8 @@ def _shell_step_exfil(
     known = identities | step_identities
     literal = any(_literal_external_transfer(transfer) for transfer in transfers)
     dynamic = any(
-        _dynamic_identity_match(transfer, cwd, known) for transfer in transfers
+        _dynamic_identity_match(transfer, cwd, known, prefixes)
+        for transfer in transfers
     )
     if shell_sources and (literal or dynamic):
         return True
@@ -1440,7 +1480,8 @@ def _shell_step_exfil(
     return content_taint and (
         literal
         or any(
-            _dynamic_identity_match(transfer, cwd, identities) for transfer in transfers
+            _dynamic_identity_match(transfer, cwd, identities, prefixes)
+            for transfer in transfers
         )
     )
 
@@ -1478,30 +1519,142 @@ def _literal_remote_external(remote: str) -> bool:
     return bool(git and _external_host(git.group(1).strip("[]")))
 
 
-def _remember_blob(blobs: list[str], result: str) -> None:
+def _blob_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _remember_blob(blobs: list[str], hashes: set[str], result: str) -> None:
     text = result.strip()
-    if (
-        len(text) < _SECRET_BLOB_MIN
-        or len(text) > _SECRET_BLOB_MAX
-        or text in blobs
-        or len(blobs) >= _SECRET_BLOB_CAP
-    ):
+    if len(text) < _SECRET_BLOB_MIN:
+        return
+    digest = _blob_digest(text)
+    if digest not in hashes and len(hashes) < _SECRET_HASH_CAP:
+        hashes.add(digest)
+    if len(text) > _SECRET_BLOB_MAX or text in blobs or len(blobs) >= _SECRET_BLOB_CAP:
         return
     blobs.append(text)
 
 
-def _write_plants_secret(step: Step, cwd: str, blobs: Sequence[str]) -> bool:
-    """A non-scratch write whose body contains an earlier sensitive result."""
-    if step.family_name != "file_write" or not blobs:
+def _body_carries_secret(body: str, blobs: Sequence[str], hashes: set[str]) -> bool:
+    stripped = body.strip()
+    if stripped and _blob_digest(stripped) in hashes:
+        return True
+    return any(blob in body for blob in blobs)
+
+
+def _outside_scratch(path: str) -> bool:
+    return (
+        path.startswith("/")
+        and not path.startswith("/dev/")
+        and not _config_scratch(path)
+    )
+
+
+def _write_plants_secret(
+    step: Step, cwd: str, blobs: Sequence[str], hashes: set[str], identities: set[str]
+) -> bool:
+    """A write of an earlier sensitive result.
+
+    The destination is an identity even under ``/tmp``, so a later dynamic
+    upload of that path matches. The tree latch is planted only outside
+    ``/tmp``, ``/var/tmp``, and ``/dev``.
+    """
+    if step.family_name != "file_write" or not (blobs or hashes):
         return False
     bodies = _write_bodies(step)
-    if not any(blob in body for blob in blobs for body in bodies):
+    if not any(_body_carries_secret(body, blobs, hashes) for body in bodies):
         return False
-    return any(
-        (path := _candidate_for_match(value, cwd)).startswith("/")
-        and not _config_scratch(path)
-        for value in _field_paths(step)
-    )
+    planted = False
+    for value in _field_paths(step):
+        identity = _path_identity(value, cwd)
+        if identity and not identity.startswith("/dev/"):
+            identities.add(identity)
+        path = _candidate_for_match(value, cwd)
+        planted = planted or _outside_scratch(path)
+    return planted
+
+
+def _absorb_copies(
+    copies: Sequence[tuple[str, str]], cwd: str, identities: set[str]
+) -> tuple[set[str], bool]:
+    """Remember destinations of a sensitive path or of a path already known.
+
+    Copies are applied in order, so a second hop in the same command sees the
+    first destination. ``/dev`` is not an identity and does not plant the tree.
+    """
+    known = set(identities)
+    produced: set[str] = set()
+    planted = False
+    for source, dest in copies:
+        source_id = _path_identity(source, cwd)
+        if not _path_is_sensitive(source, cwd, "") and not (
+            source_id and source_id in known
+        ):
+            continue
+        dest_id = _path_identity(dest, cwd)
+        if not dest_id or dest_id.startswith("/dev/"):
+            continue
+        known.add(dest_id)
+        produced.add(dest_id)
+        planted = planted or _outside_scratch(_candidate_for_match(dest, cwd))
+    return produced, planted
+
+
+def _absorb_prefixes(step: Step, cwd: str, identities: set[str]) -> set[str]:
+    """``split`` prefixes whose input is sensitive or already a known identity."""
+    found: set[str] = set()
+    if step.family_name not in SHELL_TOOLS:
+        return found
+    for source, prefix in shell_split_prefixes(step):
+        source_id = _path_identity(source, cwd)
+        if not _path_is_sensitive(source, cwd, "") and not (
+            source_id and source_id in identities
+        ):
+            continue
+        if prefix and "/" in prefix and not prefix.startswith("/dev/"):
+            found.add(prefix)
+    return found
+
+
+def _split_piece(path: str, prefixes: set[str]) -> bool:
+    """True when ``path`` is ``prefix`` plus a 1–4 character alphanumeric suffix."""
+    if not path:
+        return False
+    for prefix in prefixes:
+        if "/" not in prefix or path == prefix or not path.startswith(prefix):
+            continue
+        suffix = path[len(prefix) :]
+        if 0 < len(suffix) <= 4 and suffix.isalnum():
+            return True
+    return False
+
+
+def _directory_for_step(reported: str, scope: ShellScope) -> str:
+    """Effective directory for this step.
+
+    An absolute tracer directory that differs from the anchor replaces the
+    effective directory. The same absolute anchor keeps a ``cd`` from an
+    earlier command. A relative tracer directory joins the effective one and
+    becomes the new anchor. ``~``, an unassigned ``$HOME``, and other
+    expansions are ignored. An assigned name is substituted first.
+    """
+    if not reported:
+        return scope.cwd
+    text = _substitute_assignments(reported)
+    if not text or not _NON_LITERAL_PATH.isdisjoint(text):
+        return scope.cwd
+    if text.startswith("/"):
+        literal = posixpath.normpath(text)
+        if literal != scope.anchor:
+            scope.anchor = literal
+            scope.cwd = literal
+        return scope.cwd
+    if not scope.cwd:
+        return ""
+    joined = posixpath.normpath(posixpath.join(scope.cwd, text))
+    scope.cwd = joined
+    scope.anchor = joined
+    return scope.cwd
 
 
 def _breaks_git_flow(step: Step) -> bool:
@@ -1530,13 +1683,25 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
     that never plants the secret still clears the git flow. A shell
     ``git push`` of a literal external URL is that same push, not a content
     sink, so ``read .env`` then ``pytest`` then ``git push`` stays clear.
+    Shell assignments and ``cd`` last for this call only.
     """
+    scope = ShellScope()
+    token = activate_scope(scope)
+    try:
+        return _evaluate_rules(steps, scope)
+    finally:
+        restore_scope(token)
+
+
+def _evaluate_rules(steps: Sequence[Step], scope: ShellScope) -> tuple[RuleHit, ...]:
     fired: set[str] = set()
     content_taint = False
     git_taint = False
     tree_secret = False
     blobs: list[str] = []
+    hashes: set[str] = set()
     identities: set[str] = set()
+    prefixes: set[str] = set()
     inspection_seen = False
     listed: set[str] = set()
     read: set[str] = set()
@@ -1547,25 +1712,16 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
         for value in _field_paths(step)
         if value.startswith("/") and (path := _literal_path(value))
     }
-    prior_cwd = ""
     privilege_weight = 0.0
     for step in steps:
         reported_cwd = next(
             (value for field, value in step.fields if field == "cwd"), ""
         )
-        # A non-literal cwd (`~`, `$HOME`) cannot be resolved. Keep the last
-        # absolute directory instead of forgetting it.
-        if reported_cwd:
-            literal_cwd = _literal_path(reported_cwd)
-            if literal_cwd.startswith("/"):
-                cwd = literal_cwd
-                prior_cwd = cwd
-            else:
-                cwd = prior_cwd
-        else:
-            cwd = prior_cwd
+        cwd = _directory_for_step(reported_cwd, scope)
         if not cwd.startswith("/"):
             cwd = ""
+            if not scope.cwd.startswith("/"):
+                scope.cwd = ""
         destructive = is_destructive(step) or _config_overwrite(step, cwd)
         transfers = tuple(shell_transfers(step))
         family = step.family_name
@@ -1575,12 +1731,9 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
         env_dump = family in SHELL_TOOLS and _real_env_dump(step)
         step_sensitive = _sensitive_read(step, cwd)
         copies = tuple(shell_local_copies(step)) if family in SHELL_TOOLS else ()
-        copy_ids = {
-            identity
-            for source, dest in copies
-            if _path_is_sensitive(source, cwd, "")
-            and (identity := _path_identity(dest, cwd))
-        }
+        produced, planted = _absorb_copies(copies, cwd, identities)
+        step_prefixes = _absorb_prefixes(step, cwd, identities | produced)
+        known_prefixes = prefixes | step_prefixes
         dedicated_send = family in SEND_TOOLS
         content_send = (
             content_taint
@@ -1604,7 +1757,8 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
             content_taint,
             shell_sources,
             env_dump,
-            identities | copy_ids,
+            identities | produced,
+            known_prefixes,
         )
         if content_send or git_send or shell_git or shell_send:
             fired.add("exfil:read-then-send")
@@ -1620,27 +1774,24 @@ def evaluate_rules(steps: Sequence[Step]) -> tuple[RuleHit, ...]:
         if step_sensitive:
             content_taint = True
             git_taint = True
-            _remember_blob(blobs, step.result)
+            _remember_blob(blobs, hashes, step.result)
             if family in READ_TOOLS:
                 for value in _path_candidates(step):
                     _remember_sensitive(value, cwd, step.result, identities)
             for operand in shell_sources:
                 _remember_sensitive(operand, cwd, "", identities)
-            identities.update(copy_ids)
-            for source, dest in copies:
-                if not _path_is_sensitive(source, cwd, ""):
-                    continue
-                planted = _candidate_for_match(dest, cwd)
-                if planted.startswith("/") and not _config_scratch(planted):
-                    tree_secret = True
         elif _breaks_git_flow(step):
             git_taint = False
-        if _write_plants_secret(step, cwd, blobs):
+        identities.update(produced)
+        prefixes.update(step_prefixes)
+        if planted or _write_plants_secret(step, cwd, blobs, hashes, identities):
             tree_secret = True
         if not destructive:
             _inspection_paths(step, cwd, listed, read)
         inspection_seen = inspection_seen or _is_inspection(step, destructive)
         privilege_weight = max(privilege_weight, _privilege_weight(step))
+        if family in SHELL_TOOLS:
+            scope.cwd = shell_directory_after(step, cwd)
     if privilege_weight:
         fired.add("escalation:privilege-op")
     return tuple(

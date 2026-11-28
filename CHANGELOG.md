@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.9.0
+
+- Close the round-5 taint-laundering findings. Python reads now include
+  `.readlines()` and iteration of an `open()` handle; sends now include
+  `requests.post` and `httpx.post`; bash `$(< file)` is a substituted
+  read.
+- A shell redirect, `tee`, or a Python write plants the git tree latch,
+  not only the copy tools. `shutil.copy` remembers the destination as
+  well as the source. Archive and compression tools (`tar`, `zip`,
+  `gzip` family, `openssl enc`, `split`, `cpio`, `dd`) start taint with
+  source/destination pairs.
+- `ln` and `ln -s` keep the target's path identity instead of laundering
+  it, and a second hop keeps the identity a dynamic upload requires.
+- Shell assignments persist across commands in the same trace scope, and
+  the scanner tracks `cd` plus a relative `cwd`, resolving relative
+  paths against the directory in effect at each step.
+- The git tree latch no longer forgets a secret past 32 distinct results
+  or 8,192 characters.
+- The classifier's `file_write` → `http_post` flag survives one
+  intervening benign step.
+- Corpus line unchanged: TP=40 FP=5 TN=75 FN=0, F1 0.9412, FPR 0.0625,
+  all families 1.0000. TrustBreaker trace bypass unchanged at 3.72%
+  (the mutation operators do not generate the round-5 shapes).
+
 ## 0.8.0
 
 - Share one shell lexer between the reader and the transfer parser. A
